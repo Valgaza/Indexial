@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
-import boto3
+import requests
 import json
 import os
 import threading
@@ -51,58 +51,69 @@ class MemoryManager:
 
 memory = MemoryManager()
 
-# -------------------------- Bedrock Embedding --------------------------
+# -------------------------- Jina Embedding (Open Source) --------------------------
 
-class BedrockEmbeddingClient:
+class JinaEmbeddingClient:
+    """Jina AI embeddings client for generating 1024-dimensional vectors."""
+    
     def __init__(self):
-        """Initialize AWS Bedrock Embedding Client"""
-        AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-        AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-        ROLE_ARN = os.getenv("BEDROCK_ROLE_ARN")
-        REGION = os.getenv("AWS_REGION", "us-east-1")
-
-        # Step 1: Assume role
-        sts_client = boto3.client(
-            "sts",
-            region_name=REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            verify=False
-        )
-
-        assumed_role = sts_client.assume_role(
-            RoleArn=ROLE_ARN,
-            RoleSessionName="BedrockSession"
-        )
-        creds = assumed_role["Credentials"]
-
-        # Step 2: Bedrock runtime client
-        self.bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=REGION,
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-            verify=False
-        )
-
+        load_dotenv()
+        self.api_key = os.getenv("JINA_API_KEY")
+        if not self.api_key:
+            raise ValueError("JINA_API_KEY environment variable is required")
+        
+        self.api_url = os.getenv("JINA_API_URL", "https://api.jina.ai/v1/embeddings")
+        self.model = os.getenv("JINA_MODEL", "jina-embeddings-v3")
+        self.dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
+        self.task = os.getenv("JINA_TASK", "text-matching")
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+    
+    def embed(self, text: str) -> List[float]:
+        """Generate embedding vector for the given text."""
+        payload = {
+            "model": self.model,
+            "task": self.task,
+            "dimensions": self.dimensions,
+            "input": text
+        }
+        
+        try:
+            response = requests.post(
+                self.api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract embedding from response
+            embedding = data["data"][0]["embedding"]
+            
+            if len(embedding) != self.dimensions:
+                raise ValueError(f"Expected {self.dimensions} dimensions, got {len(embedding)}")
+            
+            return embedding
+        
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Jina API request failed: {e}")
+        except (KeyError, IndexError) as e:
+            raise ValueError(f"Unexpected response format from Jina API: {e}")
+    
     def embed_query(self, text: str) -> List[float]:
-        """Generate embeddings using Amazon Titan Embeddings"""
-        response = self.bedrock_client.invoke_model(
-            modelId="amazon.titan-embed-text-v2:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({"inputText": text})
-        )
-        result = json.loads(response["body"].read())
-        return result["embedding"]
+        """Alias for embed() to maintain compatibility with existing code."""
+        return self.embed(text)
 
 
 # -------------------------- RAG Orchestrator --------------------------
 
 class DocumentRAG:
     def __init__(self):
-        self.embedding_model = BedrockEmbeddingClient()
+        self.embedding_model = JinaEmbeddingClient()
         self.qdrant_client = QdrantClient(host="localhost", port=6333)
         self.llm_client = LLMClient()
 
@@ -244,7 +255,7 @@ rag_system = DocumentRAG()
 
 @app.route("/")
 def root():
-    return jsonify({"message": "Document RAG API with Bedrock embeddings is running"})
+    return jsonify({"message": "Document RAG API with Jina embeddings is running"})
 
 @app.route("/memory/clear", methods=["POST"])
 def clear_memory():

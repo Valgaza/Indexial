@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-import boto3
+import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -118,54 +118,58 @@ def extract_headings_from_markdown(md: str) -> Tuple[Optional[str], Optional[str
     return heading_md, subheading_md
 
 
-# =================== Bedrock Embeddings (unchanged from yours) =================== #
+# =================== Jina Embeddings (Open Source) =================== #
 
-class BedrockEmbeddingClient:
+class JinaEmbeddingClient:
+    """Jina AI embeddings client for generating 1024-dimensional vectors."""
+    
     def __init__(self):
         load_dotenv()
-        self.region = os.getenv("BEDROCK_REGION", "us-east-1")
-        self.role_arn = os.getenv("BEDROCK_ROLE_ARN")
-        self.model_id = os.getenv("BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0")
-
-        if self.role_arn:
-            sts_client = boto3.client(
-                "sts",
-                region_name=self.region,
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID") or None,
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY") or None,
-                aws_session_token=os.getenv("AWS_SESSION_TOKEN") or None,
-            )
-            assumed = sts_client.assume_role(
-                RoleArn=self.role_arn,
-                RoleSessionName=f"BedrockEmbeddingsSession-{uuid.uuid4().hex[:8]}"
-            )
-            creds = assumed["Credentials"]
-            self.client = boto3.client(
-                "bedrock-runtime",
-                region_name=self.region,
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-            )
-        else:
-            self.client = boto3.client("bedrock-runtime", region_name=self.region)
-
+        self.api_key = os.getenv("JINA_API_KEY")
+        if not self.api_key:
+            raise ValueError("JINA_API_KEY environment variable is required")
+        
+        self.api_url = os.getenv("JINA_API_URL", "https://api.jina.ai/v1/embeddings")
+        self.model = os.getenv("JINA_MODEL", "jina-embeddings-v3")
+        self.dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
+        self.task = os.getenv("JINA_TASK", "text-matching")
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+    
     def embed(self, text: str) -> List[float]:
-        payload = {"inputText": text}
-        resp = self.client.invoke_model(
-            modelId=self.model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload),
-        )
-        body = resp["body"].read()
-        parsed = json.loads(body)
-        vec = parsed.get("embedding") or parsed.get("embeddings") or []
-        if isinstance(vec, dict) and "values" in vec:
-            vec = vec["values"]
-        if not isinstance(vec, list):
-            raise ValueError(f"Unexpected embedding format from Bedrock: {type(vec)}")
-        return [float(x) for x in vec]
+        """Generate embedding vector for the given text."""
+        payload = {
+            "model": self.model,
+            "task": self.task,
+            "dimensions": self.dimensions,
+            "input": text
+        }
+        
+        try:
+            response = requests.post(
+                self.api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract embedding from response
+            embedding = data["data"][0]["embedding"]
+            
+            if len(embedding) != self.dimensions:
+                raise ValueError(f"Expected {self.dimensions} dimensions, got {len(embedding)}")
+            
+            return embedding
+        
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Jina API request failed: {e}")
+        except (KeyError, IndexError) as e:
+            raise ValueError(f"Unexpected response format from Jina API: {e}")
 
 
 # ======================= NEW: LLM JSON Field Extractor ======================== #
@@ -528,7 +532,7 @@ class DocumentProcessor:
         self.collection_name = os.getenv("QDRANT_COLLECTION_NAME", "documents_collection")
         self.client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
 
-        self.embedder = BedrockEmbeddingClient()
+        self.embedder = JinaEmbeddingClient()
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=350, length_function=len)
 
         self.llm_classifier = LLMClient() if LLMClient else None
@@ -549,7 +553,7 @@ class DocumentProcessor:
         try:
             collections = self.client.get_collections()
             collection_names = [col.name for col in collections.collections]
-            vector_size = int(os.getenv("QDRANT_VECTOR_SIZE", "1024"))  # Titan v2 = 1024 dims
+            vector_size = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))  # Jina v3 = 1024 dims
             if self.collection_name not in collection_names:
                 self.client.create_collection(
                     collection_name=self.collection_name,
