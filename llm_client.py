@@ -1,7 +1,7 @@
 import os
 import re
 import json
-import boto3
+import requests
 import psycopg2
 from psycopg2 import errors as pg_errors
 from typing import Dict, Any, Optional, Tuple, List
@@ -12,51 +12,16 @@ load_dotenv()
 
 class LLMClient:
 
-    # -------------------------- Init & Bedrock Setup --------------------------
+    # -------------------------- Init & Groq Setup --------------------------
 
     def __init__(self):
-        # --- Bedrock credentials / client ---
-        region = os.getenv("AWS_REGION", "us-east-1")
-        role_arn = os.getenv("BEDROCK_ROLE_ARN")
-
-        session_kwargs: Dict[str, Any] = {"region_name": region}
-
-        # Use base keys if provided (optional; otherwise, let default AWS chain resolve)
-        base_access = os.getenv("AWS_ACCESS_KEY_ID")
-        base_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
-        base_token = os.getenv("AWS_SESSION_TOKEN")
-        if base_access and base_secret:
-            session_kwargs.update(
-                {
-                    "aws_access_key_id": base_access,
-                    "aws_secret_access_key": base_secret,
-                    **({"aws_session_token": base_token} if base_token else {}),
-                }
-            )
-
-        if role_arn:
-            # Assume a Bedrock-enabled role if specified
-            sts_client = boto3.client("sts", **session_kwargs)
-            assumed = sts_client.assume_role(
-                RoleArn=role_arn, RoleSessionName="BedrockSession"
-            )["Credentials"]
-            self.bedrock_client = boto3.client(
-                "bedrock-runtime",
-                region_name=region,
-                aws_access_key_id=assumed["AccessKeyId"],
-                aws_secret_access_key=assumed["SecretAccessKey"],
-                aws_session_token=assumed["SessionToken"],
-                # Set verify=False if your corp proxy breaks SSL; otherwise prefer True
-                verify=False,
-            )
-        else:
-            # Fall back to default creds (env/EC2/Role/etc.)
-            self.bedrock_client = boto3.client("bedrock-runtime", **session_kwargs)
-
-        # Default Bedrock model
-        self.model_id = os.getenv(
-            "BEDROCK_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0"
-        )
+        # --- Groq API configuration ---
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        if not self.groq_api_key:
+            raise ValueError("GROQ_API_KEY environment variable is required")
+        
+        self.groq_url = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+        self.groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
         # --- Database connection ---
         self.conn = psycopg2.connect(
@@ -83,47 +48,46 @@ class LLMClient:
         self.memory_turns = int(os.getenv("MEMORY_MAX_TURNS", "6"))
         self.memory_chars = int(os.getenv("MEMORY_MAX_CHARS", "2000"))
 
-    # -------------------------- Bedrock Helpers --------------------------
+    # -------------------------- Groq Helpers --------------------------
 
-    def _bedrock_chat(
+    def _groq_chat(
         self,
         messages: List[Dict[str, Any]],
         max_tokens: int = 500,
         temperature: float = 0.1,
     ) -> str:
         """
-        Pass OpenAI-style 'messages' directly (supports 'system'/'user'/'assistant').
+        Call Groq API with OpenAI-style messages (supports 'system'/'user'/'assistant').
         Returns assistant text.
         """
-        system_parts: List[str] = []
-        convo: List[Dict[str, Any]] = []
-        for m in messages:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if role == "system":
-                system_parts.append(str(content))
-            elif role in ("user", "assistant"):
-                convo.append(
-                    {"role": role, "content": [{"type": "text", "text": str(content)}]}
-                )
-
-        body: Dict[str, Any] = {
-            "anthropic_version": "bedrock-2023-05-31",
+        # Groq uses standard OpenAI format - messages can be passed directly
+        payload = {
+            "model": self.groq_model,
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "messages": convo,
         }
-        if system_parts:
-            body["system"] = "\n\n".join(system_parts)
-
-        response = self.bedrock_client.invoke_model(
-            modelId=self.model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
-        )
-        payload = json.loads(response["body"].read())
-        return payload["content"][0]["text"].strip()
+        
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        try:
+            response = requests.post(
+                self.groq_url,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"].strip()
+        
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Groq API request failed: {e}")
+        except (KeyError, IndexError) as e:
+            raise ValueError(f"Unexpected response format from Groq API: {e}")
 
     @staticmethod
     def _strip_code_fences(text: str) -> str:
@@ -266,7 +230,7 @@ class LLMClient:
                     ),
                 },
             ]
-            out = self._bedrock_chat(messages, max_tokens=120, temperature=0.0)
+            out = self._groq_chat(messages, max_tokens=120, temperature=0.0)
             return self._strip_code_fences(out) or query
         except Exception:
             return query
@@ -313,7 +277,7 @@ Return only one word: SQL or RAG
 """.strip()
 
         try:
-            text = self._bedrock_chat(
+            text = self._groq_chat(
                 messages=[
                     {"role": "system", "content": "Respond with exactly 'SQL' or 'RAG'."},
                     {"role": "user", "content": user_prompt},
@@ -358,7 +322,7 @@ Query: {query}
 """.strip()
 
         try:
-            sql_text = self._bedrock_chat(
+            sql_text = self._groq_chat(
                 messages=[
                     {"role": "system", "content": "You are an expert SQL generator."},
                     {"role": "user", "content": sql_prompt},
@@ -455,7 +419,7 @@ Instructions:
 """.strip()
 
         try:
-            return self._bedrock_chat(
+            return self._groq_chat(
                 messages=[
                     {
                         "role": "system",
@@ -486,56 +450,3 @@ Instructions:
             if context is None:
                 context = "No context provided."
             return self.generate_response(query, context, memory=memory)
-
-    # -------------------------- Doc-type Classification --------------------------
-
-    def classify_document_type(self, text: str) -> Tuple[str, float, List[str]]:
-        snippet = text[:24000]
-
-        user_prompt = f"""
-You are a legal-doc classifier. Read the document and decide if it is:
-- "SOW" (Statement of Work: services/deliverables, Statement of Work, fees, term, assumptions, signatories)
-- "CHANGE_REQUEST" (CR: changes to scope/cost/timing of an existing SOW; fields like Revised SOW Amount, Timing Impact)
-- "AMENDMENT" (amendment to an agreement/SOW; language like "This Amendment is made by and between", "amends", "effective date", "amended contract value")
-- "UNKNOWN" (if ambiguous)
-
-Return ONLY a strict JSON object with keys:
-{{
-  "doc_type": "SOW" | "CHANGE_REQUEST" | "AMENDMENT" | "UNKNOWN",
-  "confidence": 0.0-1.0,
-  "reasons": ["short bullets"]
-}}
-
-Document (truncated):
-\"\"\"{snippet}\"\"\"
-""".strip()
-
-        try:
-            raw = self._bedrock_chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You classify contract documents. Always answer with valid JSON.",
-                    },
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=220,
-                temperature=0.0,
-            )
-
-            raw = self._strip_code_fences(raw)
-            data = json.loads(raw)
-
-            doc_type = str(data.get("doc_type", "UNKNOWN")).upper()
-            conf = float(data.get("confidence", 0.0))
-            reasons = data.get("reasons", [])
-
-            if doc_type not in {"SOW", "CHANGE_REQUEST", "AMENDMENT", "UNKNOWN"}:
-                doc_type = "UNKNOWN"
-            if not isinstance(reasons, list):
-                reasons = [str(reasons)]
-            return (doc_type, conf, reasons)
-
-        except Exception as e:
-            print(f"Error classify_document_type: {e}")
-            return ("UNKNOWN", 0.0, [])

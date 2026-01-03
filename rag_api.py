@@ -122,21 +122,16 @@ class DocumentRAG:
 
     def build_filter(
         self,
-        project_id: str = None,
-        project_no: str = None,
-        project_manager_name: str = None
+        custom_filters: Optional[Dict[str, str]] = None
     ) -> Optional[Filter]:
+        """Build Qdrant filter from custom key-value pairs if provided."""
+        if not custom_filters:
+            return None
+        
         conditions = []
-
-        if project_id:
-            conditions.append(FieldCondition(key="project_id", match=MatchValue(value=project_id)))
-
-        if project_no:
-            conditions.append(FieldCondition(key="project_no", match=MatchValue(value=project_no)))
-
-        if project_manager_name:
-            conditions.append(FieldCondition(key="project_manager_name", match=MatchValue(value=project_manager_name)))
-
+        for key, value in custom_filters.items():
+            conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
+        
         return Filter(must=conditions) if conditions else None
 
     def search_documents(
@@ -145,15 +140,14 @@ class DocumentRAG:
         collection_name: str,
         limit: int = 5,
         score_threshold: float = 0.5,
-        project_id: str = None,
-        project_no: str = None,
-        project_manager_name: str = None
+        custom_filters: Optional[Dict[str, str]] = None
     ) -> List[Dict[str, Any]]:
+        """Search documents using query embedding with optional custom filters."""
         query_embedding = self.generate_query_embedding(query)
         if not query_embedding:
             return []
 
-        search_filter = self.build_filter(project_id, project_no, project_manager_name)
+        search_filter = self.build_filter(custom_filters)
 
         search_results = self.qdrant_client.query_points(
             collection_name=collection_name,
@@ -171,13 +165,8 @@ class DocumentRAG:
                 "file_name": result.payload.get("file_name"),
                 "file_path": result.payload.get("file_path"),
                 "content_preview": (result.payload.get("content", "")[:500] + "..."),
-                "project_id": result.payload.get("project_id"),
-                "project_no": result.payload.get("project_no"),
-                "project_manager_name": result.payload.get("project_manager_name"),
-                "docs_summit_date": result.payload.get("docs_summit_date"),
-                "start_date": result.payload.get("start_date"),
-                "end_date": result.payload.get("end_date"),
-                "currency_code": result.payload.get("currency_code")
+                "heading": result.payload.get("heading"),
+                "subheading": result.payload.get("subheading"),
             })
 
         return results
@@ -188,14 +177,13 @@ class DocumentRAG:
         collection_name: str,
         limit: int = 3,
         score_threshold: float = 0.7,
-        project_id: str = None,
-        project_no: str = None,
-        project_manager_name: str = None,
+        custom_filters: Optional[Dict[str, str]] = None,
         memory_msgs: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
+        """Generate RAG response with generic document context."""
 
         search_results = self.search_documents(
-            query, collection_name, limit, score_threshold, project_id, project_no, project_manager_name
+            query, collection_name, limit, score_threshold, custom_filters
         )
 
         context_parts = []
@@ -211,31 +199,20 @@ class DocumentRAG:
                 payload = full_result[0].payload
                 content = payload.get("content", "")
 
+                # Build metadata string from available fields
                 metadata_info = []
                 metadata_info.append(f"File: {payload.get('file_name', 'Unknown')}")
-                if payload.get('project_id'):
-                    metadata_info.append(f"Project ID: {payload.get('project_id')}")
-                if payload.get('project_no'):
-                    metadata_info.append(f"Project Number: {payload.get('project_no')}")
-                if payload.get('project_manager_name'):
-                    metadata_info.append(f"Project Manager: {payload.get('project_manager_name')}")
-                if payload.get('start_date'):
-                    metadata_info.append(f"Start Date: {payload.get('start_date')}")
-                if payload.get('end_date'):
-                    metadata_info.append(f"End Date: {payload.get('end_date')}")
-                if payload.get('currency_code'):
-                    metadata_info.append(f"Currency: {payload.get('currency_code')}")
-                if payload.get('docs_summit_date'):
-                    metadata_info.append(f"Document Date: {payload.get('docs_summit_date')}")
+                if payload.get('heading'):
+                    metadata_info.append(f"Heading: {payload.get('heading')}")
+                if payload.get('subheading'):
+                    metadata_info.append(f"Subheading: {payload.get('subheading')}")
 
                 metadata_str = " | ".join(metadata_info)
                 context_parts.append(f"Document Metadata: {metadata_str}\n\nDocument Content:\n{content}")
 
                 sources.append({
                     "file_name": result["file_name"],
-                    # "score": result["score"],
-                    "project_id": result["project_id"],
-                    "project_no": result["project_no"]
+                    "heading": result.get("heading"),
                 })
 
         context = "\n\n---\n\n".join(context_parts) if context_parts else "No context retrieved."

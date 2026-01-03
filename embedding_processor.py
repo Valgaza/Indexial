@@ -3,7 +3,6 @@ import re
 import json
 import uuid
 import logging
-from enum import Enum
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,13 +27,6 @@ except Exception:  # pragma: no cover
     LLMClient = None  # type: ignore
 
 # ============================= Utils (unchanged except markdown clean) ============================= #
-
-class DocType(str, Enum):
-    SOW = "SOW"
-    CHANGE_REQUEST = "CHANGE_REQUEST"
-    AMENDMENT = "AMENDMENT"
-    UNKNOWN = "UNKNOWN"
-
 
 def normalize_ws(s: str) -> str:
     s = s.replace("\u00A0", " ")
@@ -172,227 +164,7 @@ class JinaEmbeddingClient:
             raise ValueError(f"Unexpected response format from Jina API: {e}")
 
 
-# ======================= NEW: LLM JSON Field Extractor ======================== #
-
-class LLMFieldExtractor:
-    """Call an LLM on Bedrock to extract contract fields as strict JSON.
-
-    This extractor does **no regex mining** of fields. We only:
-      1) Build a doc-type specific JSON schema (keys match your old output keys).
-      2) Ask the LLM to return **only** a JSON object matching that schema.
-      3) Post-process dates via `try_parse_date` and normalize amounts.
-    """
-
-    def __init__(self):
-        load_dotenv()
-        self.region = os.getenv("BEDROCK_REGION", "us-east-1")
-        self.role_arn = os.getenv("BEDROCK_ROLE_ARN")
-        self.model_id = os.getenv("BEDROCK_LLM_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
-
-        if self.role_arn:
-            sts_client = boto3.client(
-                "sts",
-                region_name=self.region,
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID") or None,
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY") or None,
-                aws_session_token=os.getenv("AWS_SESSION_TOKEN") or None,
-            )
-            assumed = sts_client.assume_role(
-                RoleArn=self.role_arn,
-                RoleSessionName=f"BedrockLLMExtract-{uuid.uuid4().hex[:8]}"
-            )
-            creds = assumed["Credentials"]
-            self.client = boto3.client(
-                "bedrock-runtime",
-                region_name=self.region,
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-            )
-        else:
-            self.client = boto3.client("bedrock-runtime", region_name=self.region)
-
-    # ---- schema helpers ---- #
-
-    @staticmethod
-    def _base_schema() -> Dict[str, Any]:
-        return {
-            "SOW Name": None,
-            "Supplier Name": None,
-            "Supplier Geography": None,
-            "EXECUTIVE SUMMARY": None,
-            "Services": None,
-            "Deliverables": None,
-            "SOW Effective Date": None,
-            "SOW Start Date": None,
-            "SOW End Date": None,
-            "effect until": None,  # kept for legacy compat
-            "Fee Amount": None,
-            "Fee Basis - Fixed/TnM": None,
-            "Invoices": None,
-            "GEHC Project Name": None,
-            "GEHC PM Phone": None,
-            "GEHC PM Email": None,
-            "Supplier PM": None,
-            "Supplier PM Phone": None,
-            "Supplier Email": None,
-            "General Assumption": None,
-            "Out of Scope": None,
-            "SLA": None,
-            "Location": None,
-            "GEHC Signed Party": None,
-            "Supplier Signed Party": None,
-        }
-
-    @staticmethod
-    def _cr_schema() -> Dict[str, Any]:
-        return {
-            "SOW Name": None,
-            "Change Request Start Date": None,
-            "Change Request End Date": None,
-            "Supplier Name": None,
-            "Supplier Geography": None,
-            "Date Submitted": None,
-            "Change To: Delivery/Cost": None,
-            "Revised SOW Amount": None,
-            "Original SOW Amount": None,
-            "Invoices": None,
-            "Timing Impact": None,
-            "Date Response Delivered": None,
-            "GEHC Signed Party": None,
-            "Supplier Signed Party": None,
-        }
-
-    @staticmethod
-    def _amend_schema() -> Dict[str, Any]:
-        return {
-            "Ammendment Date": None,
-            "Parties": None,
-            "Effective Date": None,
-            "Total Cost": None,
-            "Payment Schedule": None,
-            "Supplier Geography": None,
-            "Supplier Name": None,
-        }
-
-    @staticmethod
-    def _norm_amount(x: Optional[str]) -> Optional[str]:
-        if not x:
-            return x
-        v = str(x).strip()
-        v = re.sub(r"[,$₹€£]", "", v)
-        v = re.sub(r"\s{2,}", " ", v)
-        return v
-
-    @staticmethod
-    def _select_schema(doc_type: DocType) -> Dict[str, Any]:
-        if doc_type == DocType.SOW:
-            return LLMFieldExtractor._base_schema()
-        if doc_type == DocType.CHANGE_REQUEST:
-            return LLMFieldExtractor._cr_schema()
-        if doc_type == DocType.AMENDMENT:
-            return LLMFieldExtractor._amend_schema()
-        # default: try SOW-like
-        return LLMFieldExtractor._base_schema()
-
-    def _build_prompt(self, text: str, doc_type: DocType, schema: Dict[str, Any]) -> Dict[str, Any]:
-        """Build Anthropic messages-style payload for Bedrock with a single user turn
-        and system guidance to avoid role alternation errors.
-        """
-        schema_keys = list(schema.keys())
-        guidance = (
-            "You are an expert contracts analyst. Extract the requested fields from the document strictly as JSON. "
-            "If a value is truly absent, return null. Do not invent values. Dates can appear in many formats; "
-            "return them as found (we will normalize later). Do not include any extra keys."
-        )
-        fields_list = "\n- " + "\n- ".join(schema_keys)
-        user_msg = (
-            f"Document type: {doc_type.value}.\n\n"
-            f"Return ONLY a JSON object with exactly these keys (values can be string or null):\n{fields_list}\n\n"
-            f"Document follows below between <doc> tags.\n<doc>\n{text[:150000]}\n</doc>"
-        )
-        return {
-            "anthropic_version": "bedrock-2023-05-31",
-            "system": guidance,
-            "max_tokens": 4096,
-            "temperature": 0,
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": user_msg}]}
-            ],
-        }
-
-    @staticmethod
-    def _extract_json_from_text(txt: str) -> Dict[str, Any]:
-        """Be forgiving if the model wraps JSON with prose; try to snip the JSON blob."""
-        try:
-            return json.loads(txt)
-        except Exception:
-            pass
-        # Find first { and last } and try again
-        start = txt.find("{")
-        end = txt.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            snippet = txt[start:end+1]
-            try:
-                return json.loads(snippet)
-            except Exception:
-                pass
-        raise ValueError("LLM did not return valid JSON")
-
-    def extract_fields(self, text: str, doc_type: DocType) -> Dict[str, Any]:
-        schema = self._select_schema(doc_type)
-        payload = self._build_prompt(text, doc_type, schema)
-        resp = self.client.invoke_model(
-            modelId=self.model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload),
-        )
-        raw = resp["body"].read().decode("utf-8")
-        data = json.loads(raw)
-        # Anthropic on Bedrock returns {"content":[{"type":"text","text":"..."}], ...}
-        try:
-            model_text = "".join([p.get("text", "") for p in data.get("content", [])]) or data.get("output_text", "")
-        except Exception:
-            model_text = data.get("output_text", "")
-        parsed = self._extract_json_from_text(model_text)
-
-        # ensure all required keys exist
-        out: Dict[str, Any] = {k: parsed.get(k) for k in schema.keys()}
-
-        # normalize dates and amounts
-        for k in list(out.keys()):
-            v = out[k]
-            if v is None:
-                continue
-            if "date" in k.lower() or k.lower().endswith(" end date") or k.lower().endswith(" start date") or k.lower() == "effect until":
-                out[k] = try_parse_date(str(v))
-            if any(tok in k.lower() for tok in ["amount", "cost", "value", "total"]):
-                out[k] = self._norm_amount(str(v))
-
-        # maintain legacy mirror for SOW end date under "effect until"
-        if doc_type == DocType.SOW and out.get("SOW End Date") and not out.get("effect until"):
-            out["effect until"] = out.get("SOW End Date")
-
-        return out
-
-
-# ================== Tiny Heuristic Doc-Type Detector (fallback) ================== #
-
-class HeuristicTypeDetector:
-    @staticmethod
-    def detect_type(text: str) -> DocType:
-        t = text.lower()
-        if re.search(r"\bchange\s+request\b", t) or re.search(r"\bcr\s*#?:?\b", t):
-            return DocType.CHANGE_REQUEST
-        if re.search(r"\bstatement\s+of\s+work\b", t) or re.search(r"\bsow\b", t):
-            return DocType.SOW
-        if re.search(r"\bamendment\b", t) or re.search(r"\bammendment\b", t):
-            return DocType.AMENDMENT
-        return DocType.UNKNOWN
-
-
-# ========================= Structure-Preserving Parser (RESTORED) ========================= #
+# ========================= Structure-Preserving Parser (Generic PDF Processing) ========================= #
 
 class StructurePreservingDocumentParser:
     """
@@ -534,10 +306,6 @@ class DocumentProcessor:
 
         self.embedder = JinaEmbeddingClient()
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=350, length_function=len)
-
-        self.llm_classifier = LLMClient() if LLMClient else None
-        self.field_extractor = LLMFieldExtractor()
-        self.heuristic = HeuristicTypeDetector()
         self.document_parser = StructurePreservingDocumentParser()
 
         self.output_folder = output_folder
@@ -574,64 +342,34 @@ class DocumentProcessor:
 
     def create_document_chunk(self, file_path: str) -> Optional[Dict[str, Any]]:
         try:
+            print(f"Processing: {file_path}")
+
+            # 1) Parse PDF -> markdown
             markdown_content = self.pdf_to_markdown(file_path)
-            if not markdown_content:
-                return None
+            clean_md = normalize_ws(clean_markdown_noise(markdown_content))
 
-            # Preserve headings (don't strip them in clean_markdown_noise)
-            cleaned = normalize_ws(clean_markdown_noise(markdown_content))
+            # 2) Extract headings from the markdown
+            heading_md, subheading_md = extract_headings_from_markdown(clean_md)
 
-            # Extract heading/subheading from the markdown we just produced
-            heading_md, subheading_md = extract_headings_from_markdown(markdown_content)
+            # 3) Chunk the markdown
+            chunks = self.text_splitter.split_text(clean_md)
+            chunk_index = 0  # For single chunk approach, or loop if you prefer multiple
 
-            # (A) LLM classification (if available)
-            llm_doc_type_str, llm_conf, llm_reasons = ("UNKNOWN", 0.0, [])
-            if self.llm_classifier:
-                try:
-                    llm_doc_type_str, llm_conf, llm_reasons = self.llm_classifier.classify_document_type(cleaned)
-                except Exception as e:
-                    logging.warning(f"LLM doc-type classification failed: {e}")
-
-            # (B) Heuristic detection fallback
-            heur_type = self.heuristic.detect_type(cleaned)
-
-            # (C) Decide final type
-            final_doc_type = heur_type
-            try:
-                if llm_doc_type_str != "UNKNOWN" and llm_conf >= 0.55:
-                    final_doc_type = DocType[llm_doc_type_str]
-                elif heur_type == DocType.UNKNOWN and llm_doc_type_str in {"SOW", "CHANGE_REQUEST", "AMENDMENT"}:
-                    final_doc_type = DocType[llm_doc_type_str]
-            except Exception:
-                pass
-
-            # (D) **LLM JSON extraction**
-            fields = self.field_extractor.extract_fields(cleaned, final_doc_type)
-
-            metadata = {
-                "doc_type": final_doc_type.value,
-                "doc_type_llm": llm_doc_type_str,
-                "doc_type_llm_confidence": llm_conf,
-                "doc_type_llm_reasons": llm_reasons,
-                "doc_type_heuristic": heur_type.value,
-                "extracted_fields": fields,
-                # Save headings in metadata as well
-                "heading_md": heading_md,
-                "subheading_md": subheading_md,
-            }
-
-            chunk = {
-                "id": str(uuid.uuid4()),
-                "file_path": file_path,
+            chunk_dict = {
+                "id": f"{os.path.basename(file_path)}_chunk_{chunk_index}",
                 "file_name": os.path.basename(file_path),
-                "content": markdown_content,   # contains '#', '##' structure
-                "content_type": "document",
-                "processed_date": datetime.now().isoformat(),
-                "metadata": metadata,
+                "file_path": file_path,
+                "content": chunks[chunk_index] if chunks else "",
+                "chunk_index": chunk_index,
+                "heading": heading_md,
+                "subheading": subheading_md,
             }
-            return chunk
+
+            self._save_chunk_json(file_path, chunk_dict)
+            return chunk_dict
+
         except Exception as e:
-            print(f"Error creating document chunk: {e}")
+            print(f"Error processing {file_path}: {e}")
             return None
 
     def generate_embedding(self, text: str) -> List[float]:
