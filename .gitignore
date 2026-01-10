@@ -114,3 +114,5 @@ dmypy.json
 *.env.old
 tests/
 .DS_Store
+Docs/
+output/
