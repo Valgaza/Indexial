@@ -1,0 +1,762 @@
+"""
+Semantic Chunking Module
+
+This module provides semantic chunking functionality using the semchunk library
+to split text into semantically meaningful chunks, with embedding generation
+and Qdrant vector storage capabilities.
+"""
+
+import os
+import re
+import json
+import hashlib
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Callable, List, Dict, Any
+
+import requests
+import semchunk
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+
+class SemanticChunker:
+    """
+    A class for semantically chunking text using the semchunk library.
+    
+    Attributes:
+        chunk_size: Maximum number of tokens per chunk
+        overlap: Overlap ratio or token count between chunks
+        tokenizer: Tokenizer name or custom token counter
+        chunker: The semchunk chunker instance
+    """
+    
+    def __init__(
+        self,
+        chunk_size: int = 512,
+        overlap: Optional[float | int] = None,
+        tokenizer: str | Callable[[str], int] = "gpt-4",
+        memoize: bool = True,
+    ):
+        """
+        Initialize the SemanticChunker.
+        
+        Args:
+            chunk_size: Maximum number of tokens a chunk may contain.
+            overlap: Proportion (< 1) or absolute number of tokens (>= 1) 
+                     by which chunks should overlap. None for no overlap.
+            tokenizer: Name of a tiktoken/transformers tokenizer, or a custom
+                       token counting function.
+            memoize: Whether to memoize the token counter for performance.
+        """
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.tokenizer = tokenizer
+        self.memoize = memoize
+        
+        # Create the chunker using semchunk.chunkerify()
+        self.chunker = semchunk.chunkerify(
+            tokenizer_or_token_counter=tokenizer,
+            chunk_size=chunk_size,
+            memoize=memoize,
+        )
+        
+        logger.info(
+            f"Initialized SemanticChunker with chunk_size={chunk_size}, "
+            f"overlap={overlap}, tokenizer={tokenizer}"
+        )
+    
+    def chunk_text(
+        self,
+        text: str,
+        offsets: bool = False,
+    ) -> list[str] | tuple[list[str], list[tuple[int, int]]]:
+        """
+        Split text into semantically meaningful chunks.
+        
+        Args:
+            text: The text to be chunked.
+            offsets: If True, return start and end offsets of each chunk.
+        
+        Returns:
+            A list of chunks, or a tuple of (chunks, offsets) if offsets=True.
+        """
+        if not text or not text.strip():
+            logger.warning("Empty text provided for chunking")
+            return ([], []) if offsets else []
+        
+        result = self.chunker(text, offsets=offsets, overlap=self.overlap)
+        
+        if offsets:
+            chunks, chunk_offsets = result
+            logger.info(f"Created {len(chunks)} chunks with offsets")
+            return chunks, chunk_offsets
+        else:
+            logger.info(f"Created {len(result)} chunks")
+            return result
+    
+    def chunk_texts(
+        self,
+        texts: list[str],
+        offsets: bool = False,
+        processes: int = 1,
+        progress: bool = False,
+    ) -> list[list[str]] | tuple[list[list[str]], list[list[tuple[int, int]]]]:
+        """
+        Split multiple texts into semantically meaningful chunks.
+        
+        Args:
+            texts: List of texts to be chunked.
+            offsets: If True, return start and end offsets of each chunk.
+            processes: Number of processes for multiprocessing (> 1 to enable).
+            progress: If True, display a progress bar.
+        
+        Returns:
+            A list of lists of chunks, or a tuple with offsets if offsets=True.
+        """
+        if not texts:
+            logger.warning("Empty text list provided for chunking")
+            return ([], []) if offsets else []
+        
+        result = self.chunker(
+            texts,
+            offsets=offsets,
+            overlap=self.overlap,
+            processes=processes,
+            progress=progress,
+        )
+        
+        if offsets:
+            chunks_list, offsets_list = result
+            total_chunks = sum(len(c) for c in chunks_list)
+            logger.info(f"Created {total_chunks} chunks from {len(texts)} texts")
+            return chunks_list, offsets_list
+        else:
+            total_chunks = sum(len(c) for c in result)
+            logger.info(f"Created {total_chunks} chunks from {len(texts)} texts")
+            return result
+
+
+# =================== Jina Embeddings Client =================== #
+
+class JinaEmbeddingClient:
+    """
+    Jina AI embeddings client for generating vectors.
+    Supports batch embeddings for efficiency.
+    """
+    
+    def __init__(self):
+        load_dotenv()
+        self.api_key = os.getenv("JINA_API_KEY")
+        if not self.api_key:
+            raise ValueError("JINA_API_KEY environment variable is required")
+        
+        self.api_url = os.getenv("JINA_API_URL", "https://api.jina.ai/v1/embeddings")
+        self.model = os.getenv("JINA_MODEL", "jina-embeddings-v3")
+        self.dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
+        self.task = os.getenv("JINA_TASK", "text-matching")
+        self.batch_size = int(os.getenv("JINA_BATCH_SIZE", "32"))
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        logger.info(f"Initialized JinaEmbeddingClient with model={self.model}, dimensions={self.dimensions}")
+    
+    def embed(self, text: str) -> List[float]:
+        """Generate embedding vector for a single text."""
+        embeddings = self.embed_batch([text])
+        return embeddings[0] if embeddings else []
+    
+    def embed_batch(self, texts: List[str], max_chars: int = 12000) -> List[List[float]]:
+        """
+        Generate embedding vectors for multiple texts in a single API call.
+        
+        Args:
+            texts: List of texts to embed
+            max_chars: Maximum characters per text (truncated if exceeded)
+        
+        Returns:
+            List of embedding vectors
+        """
+        if not texts:
+            return []
+        
+        # Truncate texts to max length
+        truncated_texts = [text[:max_chars] for text in texts]
+        
+        all_embeddings = []
+        
+        # Process in batches
+        for i in range(0, len(truncated_texts), self.batch_size):
+            batch = truncated_texts[i:i + self.batch_size]
+            
+            payload = {
+                "model": self.model,
+                "task": self.task,
+                "dimensions": self.dimensions,
+                "input": batch
+            }
+            
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=120
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                # Extract embeddings in order
+                batch_embeddings = [item["embedding"] for item in data["data"]]
+                all_embeddings.extend(batch_embeddings)
+                
+                logger.debug(f"Embedded batch {i // self.batch_size + 1}, {len(batch)} texts")
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Jina API request failed: {e}")
+                # Return empty embeddings for failed batch
+                all_embeddings.extend([[] for _ in batch])
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected response format from Jina API: {e}")
+                all_embeddings.extend([[] for _ in batch])
+        
+        return all_embeddings
+
+
+# =================== Qdrant Vector Store =================== #
+
+class QdrantVectorStore:
+    """
+    Qdrant vector database client for storing and retrieving embeddings.
+    Uses deterministic IDs for idempotent upserts.
+    """
+    
+    def __init__(self, collection_name: Optional[str] = None):
+        load_dotenv()
+        
+        qdrant_endpoint = os.getenv("QDRANT_CLUSTER_ENDPOINT")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        self.collection_name = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "documents_collection")
+        self.vector_size = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
+        
+        if not qdrant_endpoint or not qdrant_api_key:
+            raise ValueError("QDRANT_CLUSTER_ENDPOINT and QDRANT_API_KEY must be set")
+        
+        self.client = QdrantClient(
+            url=qdrant_endpoint,
+            api_key=qdrant_api_key,
+        )
+        
+        self._ensure_collection_exists()
+        logger.info(f"Initialized QdrantVectorStore with collection={self.collection_name}")
+    
+    def _ensure_collection_exists(self):
+        """Create collection if it doesn't exist."""
+        try:
+            collections = self.client.get_collections()
+            collection_names = [col.name for col in collections.collections]
+            
+            if self.collection_name not in collection_names:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
+                )
+                logger.info(f"Created collection: {self.collection_name}")
+            else:
+                logger.info(f"Collection {self.collection_name} already exists")
+        except Exception as e:
+            logger.error(f"Error checking/creating collection: {e}")
+            raise
+    
+    @staticmethod
+    def generate_deterministic_id(content: str, source_file: str, chunk_index: int) -> str:
+        """
+        Generate a deterministic ID based on content hash.
+        This allows idempotent upserts - same content always gets same ID.
+        """
+        unique_string = f"{source_file}:{chunk_index}:{content[:500]}"
+        return hashlib.sha256(unique_string.encode()).hexdigest()[:32]
+    
+    def upsert_chunks(
+        self,
+        chunks: List[Dict[str, Any]],
+        embeddings: List[List[float]]
+    ) -> int:
+        """
+        Upsert multiple chunks with their embeddings to Qdrant.
+        
+        Args:
+            chunks: List of chunk dictionaries with metadata
+            embeddings: Corresponding embedding vectors
+        
+        Returns:
+            Number of successfully upserted points
+        """
+        if len(chunks) != len(embeddings):
+            raise ValueError("Number of chunks must match number of embeddings")
+        
+        points = []
+        for chunk, embedding in zip(chunks, embeddings):
+            if not embedding:
+                logger.warning(f"Skipping chunk {chunk.get('chunk_id')} - empty embedding")
+                continue
+            
+            # Generate deterministic ID
+            point_id = self.generate_deterministic_id(
+                content=chunk["content"],
+                source_file=chunk.get("source_file", "unknown"),
+                chunk_index=chunk.get("chunk_id", 0)
+            )
+            
+            # Build payload with all metadata
+            payload = {
+                "content": chunk["content"],
+                "source_file": chunk.get("source_file", ""),
+                "chunk_id": chunk.get("chunk_id", 0),
+                "start_offset": chunk.get("start_offset", 0),
+                "end_offset": chunk.get("end_offset", 0),
+                "heading_context": chunk.get("heading_context", ""),
+                "section": chunk.get("section", ""),
+                "processed_date": chunk.get("processed_date", datetime.now().isoformat()),
+            }
+            
+            points.append(PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload=payload
+            ))
+        
+        if not points:
+            logger.warning("No valid points to upsert")
+            return 0
+        
+        try:
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points
+            )
+            logger.info(f"Upserted {len(points)} points to Qdrant")
+            return len(points)
+        except Exception as e:
+            logger.error(f"Error upserting to Qdrant: {e}")
+            return 0
+    
+    def search(
+        self,
+        query_vector: List[float],
+        limit: int = 5,
+        score_threshold: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for similar chunks in the collection.
+        
+        Args:
+            query_vector: Query embedding vector
+            limit: Maximum number of results
+            score_threshold: Minimum similarity score (optional)
+        
+        Returns:
+            List of matching chunks with scores
+        """
+        try:
+            results = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_vector,
+                limit=limit,
+                score_threshold=score_threshold
+            )
+            
+            return [
+                {
+                    "id": hit.id,
+                    "score": hit.score,
+                    **hit.payload
+                }
+                for hit in results
+            ]
+        except Exception as e:
+            logger.error(f"Error searching Qdrant: {e}")
+            return []
+
+
+# =================== Document Processor =================== #
+
+class DocumentProcessor:
+    """
+    Main processor that combines chunking, embedding, and vector storage.
+    Implements batch processing with heading context for better retrieval.
+    """
+    
+    def __init__(
+        self,
+        chunk_size: int = 512,
+        overlap: Optional[float | int] = 0.1,
+        tokenizer: str = "gpt-4",
+        output_dir: str = "output",
+        collection_name: Optional[str] = None,
+        embed_with_context: bool = True,
+    ):
+        """
+        Initialize the document processor.
+        
+        Args:
+            chunk_size: Maximum tokens per chunk
+            overlap: Overlap ratio or token count
+            tokenizer: Tokenizer name for semchunk
+            output_dir: Directory for saving outputs
+            collection_name: Qdrant collection name
+            embed_with_context: Whether to prepend heading context when embedding
+        """
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.tokenizer = tokenizer
+        self.output_dir = Path(output_dir)
+        self.embed_with_context = embed_with_context
+        
+        # Initialize components
+        self.chunker = SemanticChunker(
+            chunk_size=chunk_size,
+            overlap=overlap,
+            tokenizer=tokenizer,
+        )
+        self.embedder = JinaEmbeddingClient()
+        self.vector_store = QdrantVectorStore(collection_name=collection_name)
+        
+        # Create output directories
+        self.chunks_dir = self.output_dir / "chunks"
+        self.chunks_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Initialized DocumentProcessor with chunk_size={chunk_size}, overlap={overlap}")
+    
+    def extract_heading_context(self, text: str, start_offset: int) -> str:
+        """
+        Extract the most recent heading before the chunk position.
+        Returns heading context for better semantic embedding.
+        """
+        # Find all markdown headings before this position
+        text_before = text[:start_offset]
+        
+        # Match headings (# to ####)
+        heading_pattern = re.compile(r'^(#{1,4})\s+(.+)$', re.MULTILINE)
+        headings = list(heading_pattern.finditer(text_before))
+        
+        if not headings:
+            return ""
+        
+        # Build hierarchy from most recent headings at each level
+        hierarchy = {}
+        for match in headings:
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            hierarchy[level] = title
+            # Clear lower level headings when a higher level is found
+            for l in list(hierarchy.keys()):
+                if l > level:
+                    del hierarchy[l]
+        
+        # Build context string
+        context_parts = [hierarchy.get(i, "") for i in sorted(hierarchy.keys())]
+        return " > ".join(filter(None, context_parts))
+    
+    def process_markdown_file(
+        self,
+        input_path: str,
+        save_chunks: bool = True,
+        store_to_qdrant: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Process a markdown file: chunk, embed, and store.
+        
+        Args:
+            input_path: Path to the markdown file
+            save_chunks: Whether to save chunks as JSON files
+            store_to_qdrant: Whether to store embeddings in Qdrant
+        
+        Returns:
+            List of processed chunk dictionaries
+        """
+        input_path = Path(input_path)
+        
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+        
+        logger.info(f"Processing: {input_path}")
+        
+        # Read the file
+        with open(input_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        
+        # Chunk the text with offsets
+        chunks, offsets = self.chunker.chunk_text(text, offsets=True)
+        
+        # Build chunk data with metadata
+        chunk_data = []
+        for i, (chunk_content, (start, end)) in enumerate(zip(chunks, offsets)):
+            # Extract heading context for this chunk position
+            heading_context = self.extract_heading_context(text, start)
+            
+            chunk_info = {
+                "chunk_id": i,
+                "content": chunk_content,
+                "start_offset": start,
+                "end_offset": end,
+                "source_file": str(input_path),
+                "heading_context": heading_context,
+                "section": heading_context.split(" > ")[0] if heading_context else "",
+                "chunk_size_tokens": self.chunk_size,
+                "overlap": self.overlap,
+                "processed_date": datetime.now().isoformat(),
+            }
+            chunk_data.append(chunk_info)
+        
+        logger.info(f"Created {len(chunk_data)} chunks from {input_path.name}")
+        
+        # Save chunks locally
+        if save_chunks:
+            self._save_chunks(input_path.stem, chunk_data)
+        
+        # Generate embeddings and store to Qdrant
+        if store_to_qdrant:
+            self._embed_and_store(chunk_data)
+        
+        return chunk_data
+    
+    def _save_chunks(self, base_name: str, chunk_data: List[Dict[str, Any]]):
+        """Save chunks to JSON files."""
+        # Save individual chunks
+        for chunk in chunk_data:
+            chunk_file = self.chunks_dir / f"{base_name}_chunk_{chunk['chunk_id']:04d}.json"
+            with open(chunk_file, "w", encoding="utf-8") as f:
+                json.dump(chunk, f, indent=2, ensure_ascii=False)
+        
+        # Save all chunks in a single file
+        all_chunks_file = self.chunks_dir / f"{base_name}_all_chunks.json"
+        with open(all_chunks_file, "w", encoding="utf-8") as f:
+            json.dump(chunk_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Saved chunks to {self.chunks_dir}")
+    
+    def _embed_and_store(self, chunk_data: List[Dict[str, Any]]):
+        """Generate embeddings and store to Qdrant with batch processing."""
+        # Prepare texts for embedding
+        # Improvement: Prepend heading context for better semantic search
+        texts_to_embed = []
+        for chunk in chunk_data:
+            if self.embed_with_context and chunk.get("heading_context"):
+                # Prepend context to content for richer embedding
+                text = f"{chunk['heading_context']}\n\n{chunk['content']}"
+            else:
+                text = chunk["content"]
+            texts_to_embed.append(text)
+        
+        logger.info(f"Generating embeddings for {len(texts_to_embed)} chunks...")
+        
+        # Batch embed all chunks
+        embeddings = self.embedder.embed_batch(texts_to_embed)
+        
+        # Store to Qdrant
+        success_count = self.vector_store.upsert_chunks(chunk_data, embeddings)
+        logger.info(f"Successfully stored {success_count}/{len(chunk_data)} chunks to Qdrant")
+    
+    def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Search for chunks similar to the query.
+        
+        Args:
+            query: Search query text
+            limit: Maximum results to return
+        
+        Returns:
+            List of matching chunks with similarity scores
+        """
+        query_embedding = self.embedder.embed(query)
+        if not query_embedding:
+            logger.error("Failed to generate query embedding")
+            return []
+        
+        return self.vector_store.search(query_embedding, limit=limit)
+
+
+def chunk_markdown_file(
+    input_path: str,
+    output_dir: str = "output/chunks",
+    chunk_size: int = 512,
+    overlap: Optional[float | int] = 0.1,
+    tokenizer: str = "gpt-4",
+    save_chunks: bool = True,
+) -> list[dict]:
+    """
+    Read a markdown file, chunk it semantically, and optionally save chunks.
+    
+    Args:
+        input_path: Path to the input markdown file.
+        output_dir: Directory to save the chunked output.
+        chunk_size: Maximum number of tokens per chunk.
+        overlap: Overlap ratio or token count between chunks.
+        tokenizer: Tokenizer name for token counting.
+        save_chunks: Whether to save chunks to JSON files.
+    
+    Returns:
+        List of dictionaries containing chunk data with metadata.
+    """
+    input_path = Path(input_path)
+    
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    
+    # Read the markdown file
+    logger.info(f"Reading markdown file: {input_path}")
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    
+    # Initialize the chunker
+    chunker = SemanticChunker(
+        chunk_size=chunk_size,
+        overlap=overlap,
+        tokenizer=tokenizer,
+    )
+    
+    # Chunk the text with offsets
+    chunks, offsets = chunker.chunk_text(text, offsets=True)
+    
+    # Create chunk data with metadata
+    chunk_data = []
+    for i, (chunk, (start, end)) in enumerate(zip(chunks, offsets)):
+        chunk_info = {
+            "chunk_id": i,
+            "content": chunk,
+            "start_offset": start,
+            "end_offset": end,
+            "source_file": str(input_path),
+            "chunk_size_tokens": chunk_size,
+            "overlap": overlap,
+        }
+        chunk_data.append(chunk_info)
+    
+    logger.info(f"Created {len(chunk_data)} chunks from {input_path.name}")
+    
+    # Save chunks if requested
+    if save_chunks:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save individual chunks
+        base_name = input_path.stem
+        
+        for chunk_info in chunk_data:
+            chunk_file = output_dir / f"{base_name}_chunk_{chunk_info['chunk_id']:04d}.json"
+            with open(chunk_file, "w", encoding="utf-8") as f:
+                json.dump(chunk_info, f, indent=2, ensure_ascii=False)
+        
+        # Save all chunks in a single file
+        all_chunks_file = output_dir / f"{base_name}_all_chunks.json"
+        with open(all_chunks_file, "w", encoding="utf-8") as f:
+            json.dump(chunk_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Saved chunks to {output_dir}")
+    
+    return chunk_data
+
+
+def main():
+    """Main function to demonstrate semantic chunking on trial.md file."""
+    
+    # Path to the trial.md file
+    input_file = "output/markdown/trial.md"
+    output_directory = "output"
+    
+    # Chunking parameters
+    chunk_size = 512  # Maximum tokens per chunk
+    overlap = 0.1     # 10% overlap between chunks
+    tokenizer = "gpt-4"  # Use GPT-4's tokenizer (cl100k_base encoding)
+    
+    print("=" * 60)
+    print("Semantic Chunking with semchunk + Qdrant Storage")
+    print("=" * 60)
+    print(f"\nInput file: {input_file}")
+    print(f"Chunk size: {chunk_size} tokens")
+    print(f"Overlap: {overlap * 100}%")
+    print(f"Tokenizer: {tokenizer}")
+    print()
+    
+    try:
+        # Initialize the document processor
+        processor = DocumentProcessor(
+            chunk_size=chunk_size,
+            overlap=overlap,
+            tokenizer=tokenizer,
+            output_dir=output_directory,
+            embed_with_context=True,  # Prepend heading context for better retrieval
+        )
+        
+        # Process the markdown file
+        chunks = processor.process_markdown_file(
+            input_path=input_file,
+            save_chunks=True,
+            store_to_qdrant=True,
+        )
+        
+        print(f"\n✅ Successfully created {len(chunks)} chunks")
+        print(f"📁 Chunks saved to: {output_directory}/chunks/")
+        print(f"🔍 Embeddings stored in Qdrant collection")
+        
+        # Display summary of first few chunks
+        print("\n" + "-" * 60)
+        print("Sample Chunks Preview:")
+        print("-" * 60)
+        
+        for i, chunk in enumerate(chunks[:3]):
+            print(f"\n[Chunk {chunk['chunk_id']}]")
+            print(f"Offset: {chunk['start_offset']} - {chunk['end_offset']}")
+            if chunk.get('heading_context'):
+                print(f"Context: {chunk['heading_context']}")
+            # Show first 200 characters of content
+            preview = chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content']
+            print(f"Content: {preview}")
+        
+        if len(chunks) > 3:
+            print(f"\n... and {len(chunks) - 3} more chunks")
+        
+        # Demo: Search functionality
+        print("\n" + "-" * 60)
+        print("Search Demo:")
+        print("-" * 60)
+        
+        demo_query = "What is Ayurveda?"
+        print(f"\nSearching for: '{demo_query}'")
+        
+        results = processor.search(demo_query, limit=3)
+        for i, result in enumerate(results):
+            print(f"\n[Result {i+1}] Score: {result['score']:.4f}")
+            preview = result['content'][:150] + "..." if len(result['content']) > 150 else result['content']
+            print(f"Content: {preview}")
+        
+        return chunks
+        
+    except FileNotFoundError as e:
+        print(f"❌ Error: {e}")
+        return []
+    except ValueError as e:
+        print(f"❌ Configuration Error: {e}")
+        print("Make sure JINA_API_KEY, QDRANT_CLUSTER_ENDPOINT, and QDRANT_API_KEY are set.")
+        return []
+    except Exception as e:
+        logger.exception("Error during processing")
+        print(f"❌ Error: {e}")
+        return []
+
+
+if __name__ == "__main__":
+    main()
