@@ -397,6 +397,13 @@ class DocumentProcessor:
     """
     Main processor that combines chunking, embedding, and vector storage.
     Implements batch processing with heading context for better retrieval.
+    
+    This class is responsible ONLY for:
+    - Chunking text into semantic chunks
+    - Generating embeddings
+    - Storing embeddings in Qdrant
+    
+    For retrieval and answering, use retrieval.py
     """
     
     def __init__(
@@ -569,24 +576,6 @@ class DocumentProcessor:
         # Store to Qdrant
         success_count = self.vector_store.upsert_chunks(chunk_data, embeddings)
         logger.info(f"Successfully stored {success_count}/{len(chunk_data)} chunks to Qdrant")
-    
-    def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """
-        Search for chunks similar to the query.
-        
-        Args:
-            query: Search query text
-            limit: Maximum results to return
-        
-        Returns:
-            List of matching chunks with similarity scores
-        """
-        query_embedding = self.embedder.embed(query)
-        if not query_embedding:
-            logger.error("Failed to generate query embedding")
-            return []
-        
-        return self.vector_store.search(query_embedding, limit=limit)
 
 
 def chunk_markdown_file(
@@ -671,7 +660,7 @@ def chunk_markdown_file(
 
 
 def main():
-    """Main function to demonstrate semantic chunking on trial.md file."""
+    """Main function to chunk and embed trial.md file."""
     
     # Path to the trial.md file
     input_file = "output/markdown/trial.md"
@@ -729,19 +718,10 @@ def main():
         if len(chunks) > 3:
             print(f"\n... and {len(chunks) - 3} more chunks")
         
-        # Demo: Search functionality
-        print("\n" + "-" * 60)
-        print("Search Demo:")
-        print("-" * 60)
-        
-        demo_query = "What is Ayurveda?"
-        print(f"\nSearching for: '{demo_query}'")
-        
-        results = processor.search(demo_query, limit=3)
-        for i, result in enumerate(results):
-            print(f"\n[Result {i+1}] Score: {result['score']:.4f}")
-            preview = result['content'][:150] + "..." if len(result['content']) > 150 else result['content']
-            print(f"Content: {preview}")
+        print("\n" + "=" * 60)
+        print("✅ Chunking and embedding complete!")
+        print("Use retrieval.py to search and answer questions.")
+        print("=" * 60)
         
         return chunks
         
