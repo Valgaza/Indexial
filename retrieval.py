@@ -2,7 +2,7 @@
 Retrieval and Answering Module
 
 This module handles:
-- Semantic search in Qdrant vector database
+- Semantic search in Supabase PostgreSQL (pgvector)
 - Answer generation using Groq LLM (Llama 3.1)
 """
 
@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional
 
 import requests
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient
+import psycopg2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -158,28 +158,26 @@ Please answer the question based on the context provided above."""
 
 class Retriever:
     """
-    Retrieves relevant chunks from Qdrant and generates answers using Groq.
+    Retrieves relevant chunks from Supabase (pgvector) and generates answers using Groq.
     """
     
-    def __init__(self, collection_name: Optional[str] = None):
-        # Qdrant setup
-        qdrant_endpoint = os.getenv("QDRANT_CLUSTER_ENDPOINT")
-        qdrant_api_key = os.getenv("QDRANT_API_KEY")
-        self.collection_name = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "documents_collection")
+    def __init__(self, table_name: Optional[str] = None):
+        # Supabase setup
+        self.db_url = os.getenv("SUPABASE_DB_URL")
+        self.table_name = table_name or os.getenv("VECTOR_TABLE_NAME", "document_chunks")
         
-        if not qdrant_endpoint or not qdrant_api_key:
-            raise ValueError("QDRANT_CLUSTER_ENDPOINT and QDRANT_API_KEY must be set")
-        
-        self.qdrant_client = QdrantClient(
-            url=qdrant_endpoint,
-            api_key=qdrant_api_key,
-        )
+        if not self.db_url:
+            raise ValueError("SUPABASE_DB_URL environment variable is required")
         
         # Initialize clients
         self.embedder = JinaEmbeddingClient()
         self.llm = GroqLLMClient()
         
-        logger.info(f"Initialized Retriever with collection={self.collection_name}")
+        logger.info(f"Initialized Retriever with table={self.table_name}")
+    
+    def _get_connection(self):
+        """Get database connection."""
+        return psycopg2.connect(self.db_url)
     
     def search(
         self,
@@ -188,7 +186,7 @@ class Retriever:
         score_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar chunks in Qdrant.
+        Search for similar chunks in Supabase using cosine similarity.
         
         Args:
             query: Search query
@@ -204,29 +202,60 @@ class Retriever:
             logger.error("Failed to generate query embedding")
             return []
         
+        conn = self._get_connection()
+        cur = conn.cursor()
+        
         try:
-            results = self.qdrant_client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                limit=limit,
-                score_threshold=score_threshold,
-            )
+            # Use cosine distance operator <=>
+            # Similarity = 1 - distance
+            if score_threshold is not None:
+                sql = f"""
+                    SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                           heading_context, section, processed_date, metadata,
+                           1 - (embedding <=> %s::vector) as similarity
+                    FROM {self.table_name}
+                    WHERE 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                cur.execute(sql, (query_vector, query_vector, score_threshold, query_vector, limit))
+            else:
+                sql = f"""
+                    SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                           heading_context, section, processed_date, metadata,
+                           1 - (embedding <=> %s::vector) as similarity
+                    FROM {self.table_name}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                cur.execute(sql, (query_vector, query_vector, limit))
             
-            return [
-                {
-                    "id": hit.id,
-                    "score": hit.score,
-                    "content": hit.payload.get("content", ""),
-                    "source_file": hit.payload.get("source_file", ""),
-                    "heading_context": hit.payload.get("heading_context", ""),
-                    "section": hit.payload.get("section", ""),
-                    "chunk_id": hit.payload.get("chunk_id", 0),
-                }
-                for hit in results
-            ]
+            rows = cur.fetchall()
+            
+            results = []
+            for row in rows:
+                results.append({
+                    "id": row[0],
+                    "source_file": row[1],
+                    "chunk_id": row[2],
+                    "content": row[3],
+                    "start_offset": row[4],
+                    "end_offset": row[5],
+                    "heading_context": row[6],
+                    "section": row[7],
+                    "processed_date": row[8],
+                    "metadata": row[9],
+                    "score": row[10]
+                })
+            
+            return results
+            
         except Exception as e:
-            logger.error(f"Qdrant search failed: {e}")
+            logger.error(f"Supabase search failed: {e}")
             return []
+        finally:
+            cur.close()
+            conn.close()
     
     def build_context(self, results: List[Dict[str, Any]]) -> str:
         """Build context string from search results."""
@@ -304,7 +333,7 @@ class Retriever:
 def interactive_mode():
     """Run an interactive Q&A session."""
     print("=" * 60)
-    print("RAG Q&A System with Groq (Llama 3.1)")
+    print("RAG Q&A System with Supabase + Groq (Llama 3.1)")
     print("=" * 60)
     print("\nType your questions and press Enter.")
     print("Type 'quit' or 'exit' to stop.\n")
@@ -355,58 +384,63 @@ def interactive_mode():
 
 # ...existing code...
 
-def test_qdrant_connection():
-    """Test Qdrant connection and list collections."""
+def test_supabase_connection():
+    """Test Supabase connection and check vector table."""
     print("\n" + "=" * 50)
-    print("🧪 Testing Qdrant Connection")
+    print("🧪 Testing Supabase Connection")
     print("=" * 50)
     
-    endpoint = os.getenv("QDRANT_CLUSTER_ENDPOINT")
-    api_key = os.getenv("QDRANT_API_KEY")
+    db_url = os.getenv("SUPABASE_DB_URL")
+    table_name = os.getenv("VECTOR_TABLE_NAME", "document_chunks")
     
     # Debug: Print what we're reading
-    print(f"   Endpoint from .env: {endpoint}")
-    print(f"   API Key present: {bool(api_key)}")
-    print(f"   API Key length: {len(api_key) if api_key else 0}")
+    print(f"   DB URL present: {bool(db_url)}")
+    print(f"   Table name: {table_name}")
     
-    if not endpoint or not api_key:
-        print("❌ QDRANT_CLUSTER_ENDPOINT or QDRANT_API_KEY not set")
+    if not db_url:
+        print("❌ SUPABASE_DB_URL not set")
         return False
     
-    print(f"   Attempting connection to: {endpoint}")
+    print(f"   Attempting connection...")
     
     try:
-        client = QdrantClient(url=endpoint, api_key=api_key)
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
         
-        # Try to ping the server
-        print("   Testing connection...")
-        collections = client.get_collections()
+        # Check if table exists and count rows
+        cur.execute(f"""
+            SELECT COUNT(*) FROM {table_name}
+        """)
+        count = cur.fetchone()[0]
         
         print(f"   ✓ Connection successful!")
-        print(f"   Collections found: {len(collections.collections)}")
-        for col in collections.collections:
-            print(f"     - {col.name} ({col.points_count} points)")
+        print(f"   Table '{table_name}' has {count} chunks")
         
-        print("✅ Qdrant connection successful!")
-        return client
+        # Check vector extension
+        cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+        version = cur.fetchone()
+        if version:
+            print(f"   pgvector extension version: {version[0]}")
+        
+        cur.close()
+        conn.close()
+        
+        print("✅ Supabase connection successful!")
+        return True
     except Exception as e:
-        print(f"❌ Qdrant test failed!")
+        print(f"❌ Supabase test failed!")
         print(f"   Error type: {type(e).__name__}")
         print(f"   Error message: {str(e)}")
         
         # Additional debugging
-        if "401" in str(e) or "Unauthorized" in str(e):
+        if "password" in str(e).lower() or "authentication" in str(e).lower():
             print("\n   💡 Possible fixes:")
-            print("      - Check if QDRANT_API_KEY is correct")
-            print("      - Regenerate API key in Qdrant Cloud dashboard")
-        elif "timeout" in str(e).lower():
+            print("      - Check if SUPABASE_DB_URL contains correct password")
+            print("      - Verify database credentials in Supabase dashboard")
+        elif "does not exist" in str(e).lower():
             print("\n   💡 Possible fixes:")
-            print("      - Check your internet connection")
-            print("      - Verify cluster is running in Qdrant Cloud")
-        elif "404" in str(e) or "not found" in str(e).lower():
-            print("\n   💡 Possible fixes:")
-            print("      - Check if QDRANT_CLUSTER_ENDPOINT URL is correct")
-            print("      - Ensure cluster exists in Qdrant Cloud")
+            print(f"      - Table '{table_name}' may not exist yet")
+            print("      - Run chunker.py first to create the table")
         
         return None
 

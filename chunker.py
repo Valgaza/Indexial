@@ -17,9 +17,9 @@ from typing import Optional, Callable, List, Dict, Any
 
 import requests
 import semchunk
+import psycopg2
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -235,49 +235,65 @@ class JinaEmbeddingClient:
         return all_embeddings
 
 
-# =================== Qdrant Vector Store =================== #
+# =================== Supabase Vector Store =================== #
 
-class QdrantVectorStore:
+class SupabaseVectorStore:
     """
-    Qdrant vector database client for storing and retrieving embeddings.
+    Supabase PostgreSQL vector database client for storing and retrieving embeddings.
+    Uses pgvector extension for similarity search.
     Uses deterministic IDs for idempotent upserts.
     """
     
-    def __init__(self, collection_name: Optional[str] = None):
+    def __init__(self, table_name: Optional[str] = None):
         load_dotenv()
         
-        qdrant_endpoint = os.getenv("QDRANT_CLUSTER_ENDPOINT")
-        qdrant_api_key = os.getenv("QDRANT_API_KEY")
-        self.collection_name = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "documents_collection")
+        self.db_url = os.getenv("SUPABASE_DB_URL")
+        self.table_name = table_name or os.getenv("VECTOR_TABLE_NAME", "document_chunks")
         self.vector_size = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
         
-        if not qdrant_endpoint or not qdrant_api_key:
-            raise ValueError("QDRANT_CLUSTER_ENDPOINT and QDRANT_API_KEY must be set")
+        if not self.db_url:
+            raise ValueError("SUPABASE_DB_URL environment variable is required")
         
-        self.client = QdrantClient(
-            url=qdrant_endpoint,
-            api_key=qdrant_api_key,
-        )
-        
-        self._ensure_collection_exists()
-        logger.info(f"Initialized QdrantVectorStore with collection={self.collection_name}")
+        self._ensure_table_exists()
+        logger.info(f"Initialized SupabaseVectorStore with table={self.table_name}")
     
-    def _ensure_collection_exists(self):
-        """Create collection if it doesn't exist."""
+    def _get_connection(self):
+        """Get database connection."""
+        return psycopg2.connect(self.db_url)
+    
+    def _ensure_table_exists(self):
+        """Create the document_chunks table if it doesn't exist."""
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {self.table_name} (
+            id TEXT PRIMARY KEY,
+            source_file TEXT,
+            chunk_id INTEGER,
+            content TEXT,
+            start_offset INTEGER,
+            end_offset INTEGER,
+            heading_context TEXT,
+            section TEXT,
+            processed_date TIMESTAMP,
+            embedding vector({self.vector_size}),
+            metadata JSONB
+        );
+        
+        CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx 
+        ON {self.table_name} 
+        USING ivfflat (embedding vector_cosine_ops)
+        WITH (lists = 100);
+        """
+        
         try:
-            collections = self.client.get_collections()
-            collection_names = [col.name for col in collections.collections]
-            
-            if self.collection_name not in collection_names:
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
-                )
-                logger.info(f"Created collection: {self.collection_name}")
-            else:
-                logger.info(f"Collection {self.collection_name} already exists")
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute(create_table_sql)
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"Table {self.table_name} verified/created")
         except Exception as e:
-            logger.error(f"Error checking/creating collection: {e}")
+            logger.error(f"Failed to create table: {e}")
             raise
     
     @staticmethod
@@ -295,7 +311,7 @@ class QdrantVectorStore:
         embeddings: List[List[float]]
     ) -> int:
         """
-        Upsert multiple chunks with their embeddings to Qdrant.
+        Upsert multiple chunks with their embeddings to Supabase.
         
         Args:
             chunks: List of chunk dictionaries with metadata
@@ -307,51 +323,72 @@ class QdrantVectorStore:
         if len(chunks) != len(embeddings):
             raise ValueError("Number of chunks must match number of embeddings")
         
-        points = []
+        data_rows = []
         for chunk, embedding in zip(chunks, embeddings):
             if not embedding:
                 logger.warning(f"Skipping chunk {chunk.get('chunk_id')} - empty embedding")
                 continue
             
             # Generate deterministic ID
-            point_id = self.generate_deterministic_id(
+            chunk_id_hash = self.generate_deterministic_id(
                 content=chunk["content"],
                 source_file=chunk.get("source_file", "unknown"),
                 chunk_index=chunk.get("chunk_id", 0)
             )
             
-            # Build payload with all metadata
-            payload = {
-                "content": chunk["content"],
-                "source_file": chunk.get("source_file", ""),
-                "chunk_id": chunk.get("chunk_id", 0),
-                "start_offset": chunk.get("start_offset", 0),
-                "end_offset": chunk.get("end_offset", 0),
-                "heading_context": chunk.get("heading_context", ""),
-                "section": chunk.get("section", ""),
-                "processed_date": chunk.get("processed_date", datetime.now().isoformat()),
+            # Build metadata dict for extra fields
+            metadata = {
+                "chunk_size_tokens": chunk.get("chunk_size_tokens"),
+                "overlap": chunk.get("overlap"),
             }
             
-            points.append(PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload=payload
+            data_rows.append((
+                chunk_id_hash,
+                chunk.get("source_file", ""),
+                chunk.get("chunk_id", 0),
+                chunk["content"],
+                chunk.get("start_offset", 0),
+                chunk.get("end_offset", 0),
+                chunk.get("heading_context", ""),
+                chunk.get("section", ""),
+                chunk.get("processed_date", datetime.now().isoformat()),
+                embedding,
+                json.dumps(metadata)
             ))
         
-        if not points:
-            logger.warning("No valid points to upsert")
+        if not data_rows:
+            logger.warning("No valid chunks to upsert")
             return 0
         
+        conn = self._get_connection()
+        cur = conn.cursor()
+        
         try:
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points
-            )
-            logger.info(f"Upserted {len(points)} points to Qdrant")
-            return len(points)
+            # Use ON CONFLICT for idempotent upserts
+            query = f"""
+                INSERT INTO {self.table_name} 
+                (id, source_file, chunk_id, content, start_offset, end_offset, 
+                 heading_context, section, processed_date, embedding, metadata)
+                VALUES %s
+                ON CONFLICT (id) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    embedding = EXCLUDED.embedding,
+                    metadata = EXCLUDED.metadata,
+                    processed_date = EXCLUDED.processed_date
+            """
+            
+            execute_values(cur, query, data_rows)
+            conn.commit()
+            logger.info(f"Upserted {len(data_rows)} chunks to Supabase")
+            return len(data_rows)
+            
         except Exception as e:
-            logger.error(f"Error upserting to Qdrant: {e}")
+            conn.rollback()
+            logger.error(f"Error upserting to Supabase: {e}")
             return 0
+        finally:
+            cur.close()
+            conn.close()
     
     def search(
         self,
@@ -360,7 +397,7 @@ class QdrantVectorStore:
         score_threshold: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar chunks in the collection.
+        Search for similar chunks using cosine similarity.
         
         Args:
             query_vector: Query embedding vector
@@ -370,25 +407,60 @@ class QdrantVectorStore:
         Returns:
             List of matching chunks with scores
         """
+        conn = self._get_connection()
+        cur = conn.cursor()
+        
         try:
-            results = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                limit=limit,
-                score_threshold=score_threshold
-            )
+            # Use cosine distance operator <=>
+            # Similarity = 1 - distance
+            if score_threshold is not None:
+                sql = f"""
+                    SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                           heading_context, section, processed_date, metadata,
+                           1 - (embedding <=> %s::vector) as similarity
+                    FROM {self.table_name}
+                    WHERE 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                cur.execute(sql, (query_vector, query_vector, score_threshold, query_vector, limit))
+            else:
+                sql = f"""
+                    SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                           heading_context, section, processed_date, metadata,
+                           1 - (embedding <=> %s::vector) as similarity
+                    FROM {self.table_name}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                cur.execute(sql, (query_vector, query_vector, limit))
             
-            return [
-                {
-                    "id": hit.id,
-                    "score": hit.score,
-                    **hit.payload
-                }
-                for hit in results
-            ]
+            rows = cur.fetchall()
+            
+            results = []
+            for row in rows:
+                results.append({
+                    "id": row[0],
+                    "source_file": row[1],
+                    "chunk_id": row[2],
+                    "content": row[3],
+                    "start_offset": row[4],
+                    "end_offset": row[5],
+                    "heading_context": row[6],
+                    "section": row[7],
+                    "processed_date": row[8],
+                    "metadata": row[9],
+                    "score": row[10]
+                })
+            
+            return results
+            
         except Exception as e:
-            logger.error(f"Error searching Qdrant: {e}")
+            logger.error(f"Error searching Supabase: {e}")
             return []
+        finally:
+            cur.close()
+            conn.close()
 
 
 # =================== Document Processor =================== #
@@ -401,7 +473,7 @@ class DocumentProcessor:
     This class is responsible ONLY for:
     - Chunking text into semantic chunks
     - Generating embeddings
-    - Storing embeddings in Qdrant
+    - Storing embeddings in Supabase (pgvector)
     
     For retrieval and answering, use retrieval.py
     """
@@ -439,7 +511,7 @@ class DocumentProcessor:
             tokenizer=tokenizer,
         )
         self.embedder = JinaEmbeddingClient()
-        self.vector_store = QdrantVectorStore(collection_name=collection_name)
+        self.vector_store = SupabaseVectorStore(table_name=collection_name)
         
         # Create output directories
         self.chunks_dir = self.output_dir / "chunks"
@@ -573,9 +645,9 @@ class DocumentProcessor:
         # Batch embed all chunks
         embeddings = self.embedder.embed_batch(texts_to_embed)
         
-        # Store to Qdrant
+        # Store to Supabase
         success_count = self.vector_store.upsert_chunks(chunk_data, embeddings)
-        logger.info(f"Successfully stored {success_count}/{len(chunk_data)} chunks to Qdrant")
+        logger.info(f"Successfully stored {success_count}/{len(chunk_data)} chunks to Supabase")
 
 
 def chunk_markdown_file(
@@ -672,7 +744,7 @@ def main():
     tokenizer = "gpt-4"  # Use GPT-4's tokenizer (cl100k_base encoding)
     
     print("=" * 60)
-    print("Semantic Chunking with semchunk + Qdrant Storage")
+    print("Semantic Chunking with semchunk + Supabase Storage")
     print("=" * 60)
     print(f"\nInput file: {input_file}")
     print(f"Chunk size: {chunk_size} tokens")
@@ -699,7 +771,7 @@ def main():
         
         print(f"\n✅ Successfully created {len(chunks)} chunks")
         print(f"📁 Chunks saved to: {output_directory}/chunks/")
-        print(f"🔍 Embeddings stored in Qdrant collection")
+        print(f"🔍 Embeddings stored in Supabase pgvector table")
         
         # Display summary of first few chunks
         print("\n" + "-" * 60)
@@ -730,7 +802,7 @@ def main():
         return []
     except ValueError as e:
         print(f"❌ Configuration Error: {e}")
-        print("Make sure JINA_API_KEY, QDRANT_CLUSTER_ENDPOINT, and QDRANT_API_KEY are set.")
+        print("Make sure JINA_API_KEY and SUPABASE_DB_URL are set.")
         return []
     except Exception as e:
         logger.exception("Error during processing")
