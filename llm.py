@@ -144,6 +144,118 @@ class GroqLLM(GroqClient):
         except Exception as e:
             return f"Error generating answer: {e}"
 
+    def rewrite_followup(
+        self,
+        query: str,
+        history: List[Dict[str, str]],
+        max_tokens: int = 200,
+    ) -> str:
+        """
+        Rewrite follow-up queries with context from conversation history.
+
+        Resolves pronouns and references like:
+        - "What about X?" -> "What is X in the context of [previous topic]?"
+        - "Tell me more" -> "Tell me more about [previous topic]"
+        - "How does it work?" -> "How does [previous subject] work?"
+
+        Args:
+            query: Current user query (may have pronouns/references)
+            history: Conversation history [{role, content}, ...]
+            max_tokens: Maximum tokens in response
+
+        Returns:
+            Rewritten standalone query
+        """
+        # If no history or query seems standalone, return as-is
+        if not history or len(history) < 2:
+            return query
+
+        # Heuristic: Check if query has pronouns or short interrogatives
+        standalone_signals = [
+            r"\bwhat is\b",
+            r"\bwho is\b",
+            r"\bhow many\b",
+            r"\bshow me\b",
+            r"\blist\b",
+            r"\bexplain\b.*\b(the|a)\b",
+        ]
+
+        followup_signals = [
+            r"\bit\b",
+            r"\bthat\b",
+            r"\bthis\b",
+            r"\bthey\b",
+            r"\bthem\b",
+            r"\btell me more\b",
+            r"\bwhat about\b",
+            r"\band\b",
+            r"^(how|why|when|where)",
+        ]
+
+        query_lower = query.lower()
+
+        # If query has strong standalone signals, don't rewrite
+        import re
+        has_standalone = any(re.search(p, query_lower) for p in standalone_signals)
+        has_followup = any(re.search(p, query_lower) for p in followup_signals)
+
+        if has_standalone and not has_followup:
+            return query
+
+        # Build conversation context (last few exchanges)
+        context_parts = []
+        for msg in history[-4:]:  # Last 2 exchanges
+            role = msg.get("role", "").capitalize()
+            content = msg.get("content", "")[:200]  # Truncate
+            context_parts.append(f"{role}: {content}")
+
+        conversation_context = "\n".join(context_parts)
+
+        system_prompt = """You are a query rewriting assistant. Your task is to rewrite follow-up questions into standalone queries.
+
+Rules:
+1. Replace pronouns (it, that, this, they) with specific references from conversation history
+2. Add necessary context from previous questions/answers
+3. Keep the query concise and natural
+4. If the query is already standalone, return it unchanged
+5. Return ONLY the rewritten query, nothing else
+
+Examples:
+- "What about profit?" + [context: revenue discussed] -> "What is the profit for the same period?"
+- "Tell me more" + [context: AI definition] -> "Tell me more about artificial intelligence"
+- "How does it work?" + [context: neural networks] -> "How do neural networks work?"
+"""
+
+        user_message = f"""Conversation history:
+{conversation_context}
+
+Current query: {query}
+
+Rewrite this query to be standalone and clear. If already standalone, return it unchanged."""
+
+        try:
+            rewritten = self.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.3,
+                max_tokens=max_tokens,
+            )
+
+            # Clean up the response (remove quotes, extra text)
+            rewritten = rewritten.strip().strip('"').strip("'")
+
+            # If rewritten is too long or seems wrong, return original
+            if len(rewritten) > len(query) * 3 or len(rewritten) < 3:
+                return query
+
+            return rewritten
+
+        except Exception as e:
+            logger.error(f"Follow-up rewrite failed: {e}")
+            return query
+
 
 class GroqSchemaGenerator(GroqClient):
     """SQL schema and description generation for table ingestion."""
