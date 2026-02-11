@@ -116,3 +116,4 @@ tests/
 .DS_Store
 Docs/
 output/
+logs/
