@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from sql_engine import SQLGenerator, SafeSQLExecutor, TableRegistryReader
 from retrieval import Retriever
 from llm import GroqLLM
+from memory import MemoryManager
 
 load_dotenv()
 
@@ -237,21 +238,25 @@ class QueryOrchestrator:
     End-to-end query processing with intelligent routing.
 
     Handles:
+    - Session memory and conversation history
+    - Follow-up query rewriting
     - Query classification (SQL/RAG/HYBRID)
     - Execution via appropriate engine(s)
     - Result formatting and merging
     """
 
-    def __init__(self):
+    def __init__(self, memory: Optional[MemoryManager] = None):
         self.router = QueryRouter()
         self.sql_generator = SQLGenerator()
         self.sql_executor = SafeSQLExecutor()
         self.retriever = Retriever()
         self.llm = GroqLLM()
+        self.memory = memory or MemoryManager()
 
     def process_query(
         self,
         query: str,
+        session_id: Optional[str] = None,
         document_ids: Optional[List[str]] = None,
         force_route: Optional[RouteType] = None
     ) -> Dict[str, Any]:
@@ -260,6 +265,7 @@ class QueryOrchestrator:
 
         Args:
             query: Natural language question
+            session_id: Session identifier for conversation history
             document_ids: Optional document filter
             force_route: Override classification (for testing)
 
@@ -268,17 +274,38 @@ class QueryOrchestrator:
         """
         logger.info(f"Processing query: {query}")
 
-        # Step 1: Classify route
+        original_query = query
+
+        # Step 1: Rewrite follow-ups if session history exists
+        if session_id and self.memory.session_exists(session_id):
+            history = self.memory.get_history(session_id)
+            if history:
+                logger.info("Rewriting follow-up query with conversation context")
+                query = self.llm.rewrite_followup(query, history)
+                logger.info(f"Rewritten query: {query}")
+
+        # Step 2: Classify route
         route = force_route or self.router.classify(query, document_ids)
         logger.info(f"Route: {route}")
 
-        # Step 2: Execute based on route
+        # Step 3: Execute based on route
         if route == "SQL":
-            return self._execute_sql(query, document_ids)
+            result = self._execute_sql(query, document_ids)
         elif route == "RAG":
-            return self._execute_rag(query, document_ids)
+            result = self._execute_rag(query, document_ids)
         else:  # HYBRID
-            return self._execute_hybrid(query, document_ids)
+            result = self._execute_hybrid(query, document_ids)
+
+        # Step 4: Store exchange in memory
+        if session_id:
+            self.memory.add_exchange(session_id, original_query, result.get("answer", ""))
+
+        # Add original query to result
+        result["original_query"] = original_query
+        if original_query != query:
+            result["rewritten_query"] = query
+
+        return result
 
     def _execute_sql(
         self,
