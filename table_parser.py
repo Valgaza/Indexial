@@ -9,7 +9,6 @@ This module:
 5. Maintains a registry of all extracted tables
 """
 
-import os
 import re
 import json
 import uuid
@@ -18,10 +17,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
-import psycopg2
 from psycopg2 import sql
-import requests
 from dotenv import load_dotenv
+
+from db import get_connection
+from llm import GroqSchemaGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -347,172 +347,17 @@ class MarkdownTableExtractor:
         return len(cleaned) == 0 and "-" in line
 
 
-# =================== Groq Schema Generator =================== #
-
-class GroqSchemaGenerator:
-    """Uses Groq LLM to generate dynamic SQL schemas."""
-    
-    def __init__(self):
-        self.api_key = os.getenv("GROQ_API_KEY")
-        if not self.api_key:
-            raise ValueError("GROQ_API_KEY environment variable is required")
-        
-        self.api_url = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
-        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-        
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-    
-    def generate_schema(
-        self,
-        headers: List[str],
-        sample_rows: List[List[str]],
-        table_name: str
-    ) -> str:
-        """
-        Generate CREATE TABLE statement using Groq LLM.
-        
-        Args:
-            headers: Column headers
-            sample_rows: Sample data rows for type inference
-            table_name: Target table name
-        
-        Returns:
-            CREATE TABLE SQL statement
-        """
-        prompt = f"""You are a PostgreSQL Expert. Generate a CREATE TABLE statement.
-
-Rules:
-1. Table Name: {table_name}
-2. Add 'id' SERIAL PRIMARY KEY as the FIRST column.
-3. Analyze these headers: {headers}
-4. Analyze these sample rows: {sample_rows[:3]}
-5. Infer appropriate PostgreSQL types (TEXT, INTEGER, NUMERIC, BOOLEAN, DATE, etc.)
-6. Sanitize column names: lowercase, underscores for spaces, remove special characters.
-7. Output JSON ONLY with format: {{"sql": "CREATE TABLE..."}}
-
-Example output:
-{{"sql": "CREATE TABLE {table_name} (id SERIAL PRIMARY KEY, column_name TEXT, another_col INTEGER);"}}
-"""
-
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        }
-        
-        try:
-            response = requests.post(
-                self.api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=60
-            )
-            response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            result = json.loads(content)
-            return result.get("sql", "")
-        except Exception as e:
-            logger.error(f"Schema generation failed: {e}")
-            # Fallback: Generate simple TEXT columns
-            return self._fallback_schema(headers, table_name)
-    
-    def _fallback_schema(self, headers: List[str], table_name: str) -> str:
-        """Generate fallback schema with all TEXT columns."""
-        sanitized = [self._sanitize_column_name(h) for h in headers]
-        columns = ["id SERIAL PRIMARY KEY"]
-        columns.extend([f"{col} TEXT" for col in sanitized])
-        return f"CREATE TABLE {table_name} ({', '.join(columns)});"
-    
-    def _sanitize_column_name(self, name: str) -> str:
-        """Sanitize column name for PostgreSQL."""
-        # Lowercase, replace spaces/special chars with underscore
-        sanitized = re.sub(r'[^a-zA-Z0-9]', '_', name.lower())
-        sanitized = re.sub(r'_+', '_', sanitized)  # Collapse multiple underscores
-        sanitized = sanitized.strip('_')
-        # Ensure it doesn't start with a number
-        if sanitized and sanitized[0].isdigit():
-            sanitized = 'col_' + sanitized
-        return sanitized or 'column'
-    
-    def generate_semantic_description(
-        self,
-        headers: List[str],
-        sample_rows: List[List[str]],
-        max_length: int = 100
-    ) -> str:
-        """Generate a concise semantic description of the table using Groq LLM.
-        
-        Args:
-            headers: Column headers
-            sample_rows: Sample data rows (first 2-3 rows)
-            max_length: Maximum characters for description
-        
-        Returns:
-            Short semantic description string
-        """
-        prompt = f"""Analyze this table and provide a concise 1-sentence description (max {max_length} chars).
-
-        Headers: {headers}
-        Sample: {sample_rows[:2]}
-
-        Output JSON: {{"description": "your description here"}}"""
-
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 100,
-            "response_format": {"type": "json_object"},
-        }
-        
-        try:
-            response = requests.post(
-                self.api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            result = json.loads(content)
-            description = result.get("description", "")[:max_length]
-            return description if description else self._fallback_description(headers)
-        except Exception as e:
-            logger.warning(f"Semantic description generation failed: {e}")
-            return self._fallback_description(headers)
-    
-    def _fallback_description(self, headers: List[str]) -> str:
-        """Generate fallback description from headers."""
-        if len(headers) <= 3:
-            return f"Table with {', '.join(headers)} data"
-        return f"Table with {len(headers)} columns including {', '.join(headers[:2])}..."
-
-
 # =================== Database Ingestion =================== #
 
 class TableIngestionPipeline:
     """Handles database operations for table ingestion."""
     
     def __init__(self):
-        self.db_url = os.getenv("SUPABASE_DB_URL")
-        if not self.db_url:
-            raise ValueError("SUPABASE_DB_URL environment variable is required")
-        
         self.schema_generator = GroqSchemaGenerator()
-        
+
         # Ensure registry table exists
         self._ensure_registry_exists()
-    
-    def _get_connection(self):
-        """Get database connection."""
-        return psycopg2.connect(self.db_url)
-    
+
     def _ensure_registry_exists(self):
         """Create the table_registry if it doesn't exist."""
         create_registry_sql = """
@@ -527,42 +372,42 @@ class TableIngestionPipeline:
             extracted_at TIMESTAMP DEFAULT NOW()
         );
         """
-        
+
         try:
-            conn = self._get_connection()
-            cur = conn.cursor()
-            cur.execute(create_registry_sql)
-            conn.commit()
-            cur.close()
-            conn.close()
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(create_registry_sql)
+                conn.commit()
+                cur.close()
             logger.info("Registry table verified/created")
         except Exception as e:
             logger.error(f"Failed to create registry table: {e}")
             raise
-    
-    def ingest_table(self, table: ExtractedTable) -> Optional[str]:
+
+    def ingest_table(self, table: ExtractedTable, document_id: Optional[str] = None) -> Optional[str]:
         """
         Ingest a single extracted table into the database.
-        
+
         Args:
             table: ExtractedTable object
-        
+            document_id: UUID of the parent document (from pipeline)
+
         Returns:
             Physical table name if successful, None otherwise
         """
         if not table.headers or not table.rows:
             logger.warning("Empty table provided for ingestion")
             return None
-        
-        # Generate unique identifiers
-        doc_uuid = str(uuid.uuid4())
-        physical_table_name = f"tbl_{doc_uuid.split('-')[0]}_extracted"
-        
+
+        # Use provided document_id or generate a new one
+        doc_uuid = document_id or str(uuid.uuid4())
+        physical_table_name = f"tbl_{doc_uuid.split('-')[0]}_t{table.table_index}_extracted"
+
         logger.info(f"--- Ingesting Table {table.table_index} from {table.source_file} ---")
         logger.info(f"Target Table: {physical_table_name}")
         logger.info(f"Columns: {table.headers}")
         logger.info(f"Rows: {len(table.rows)}")
-        
+
         # 1. Generate schema and semantic description via Groq
         logger.info("Generating schema via Groq...")
         create_table_sql = self.schema_generator.generate_schema(
@@ -571,79 +416,78 @@ class TableIngestionPipeline:
             physical_table_name
         )
         logger.info(f"Generated SQL: {create_table_sql[:100]}...")
-        
+
         logger.info("Generating semantic description...")
         semantic_description = self.schema_generator.generate_semantic_description(
             table.headers,
             table.rows[:3]
         )
         logger.info(f"Description: {semantic_description}")
-        
-        conn = self._get_connection()
-        cur = conn.cursor()
-        
-        try:
-            # 2. Create the table
-            logger.info("Executing DDL...")
-            cur.execute(create_table_sql)
-            
-            # 3. Insert data
-            logger.info(f"Inserting {len(table.rows)} rows...")
-            
-            # Create placeholders
-            placeholders = ",".join(["%s"] * len(table.headers))
-            
-            # Build insert query
-            insert_query = sql.SQL("INSERT INTO {} VALUES (DEFAULT, {})").format(
-                sql.Identifier(physical_table_name),
-                sql.SQL(placeholders)
-            )
-            
-            cur.executemany(insert_query, table.rows)
-            
-            # 4. Update registry
-            logger.info("Updating Table Registry...")
-            cur.execute("""
-                INSERT INTO table_registry 
-                (physical_table_name, source_doc_uuid, semantic_description, 
-                 original_filename, headers, row_count)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (
-                physical_table_name,
-                doc_uuid,
-                semantic_description,
-                table.source_file,
-                json.dumps(table.headers),
-                len(table.rows)
-            ))
-            
-            conn.commit()
-            logger.info(f"✅ Success! Table '{physical_table_name}' created with {len(table.rows)} rows")
-            
-            return physical_table_name
-            
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"❌ Ingestion failed: {e}")
-            return None
-        finally:
-            cur.close()
-            conn.close()
+
+        with get_connection() as conn:
+            cur = conn.cursor()
+            try:
+                # 2. Create the table
+                logger.info("Executing DDL...")
+                cur.execute(create_table_sql)
+
+                # 3. Insert data
+                logger.info(f"Inserting {len(table.rows)} rows...")
+
+                # Create placeholders
+                placeholders = ",".join(["%s"] * len(table.headers))
+
+                # Build insert query
+                insert_query = sql.SQL("INSERT INTO {} VALUES (DEFAULT, {})").format(
+                    sql.Identifier(physical_table_name),
+                    sql.SQL(placeholders)
+                )
+
+                cur.executemany(insert_query, table.rows)
+
+                # 4. Update registry
+                logger.info("Updating Table Registry...")
+                cur.execute("""
+                    INSERT INTO table_registry
+                    (physical_table_name, source_doc_uuid, semantic_description,
+                     original_filename, headers, row_count)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    physical_table_name,
+                    doc_uuid,
+                    semantic_description,
+                    table.source_file,
+                    json.dumps(table.headers),
+                    len(table.rows)
+                ))
+
+                conn.commit()
+                logger.info(f"Success! Table '{physical_table_name}' created with {len(table.rows)} rows")
+
+                return physical_table_name
+
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Ingestion failed: {e}")
+                return None
+            finally:
+                cur.close()
     
-    def ingest_all_tables(self, tables: List[ExtractedTable]) -> List[str]:
+    def ingest_all_tables(self, tables: List[ExtractedTable], document_id: Optional[str] = None) -> List[str]:
         """
         Ingest multiple tables.
-        
+
         Args:
             tables: List of ExtractedTable objects
-        
+            document_id: UUID of the parent document (from pipeline)
+
         Returns:
             List of successfully created table names
         """
         created_tables = []
-        
+
         for table in tables:
-            table_name = self.ingest_table(table)
+            table_name = self.ingest_table(table, document_id=document_id)
             if table_name:
                 created_tables.append(table_name)
         
