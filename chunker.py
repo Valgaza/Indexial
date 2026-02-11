@@ -3,7 +3,7 @@ Semantic Chunking Module
 
 This module provides semantic chunking functionality using the semchunk library
 to split text into semantically meaningful chunks, with embedding generation
-and Qdrant vector storage capabilities.
+and Supabase pgvector storage capabilities.
 """
 
 import os
@@ -15,11 +15,12 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Callable, List, Dict, Any
 
-import requests
 import semchunk
-import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
+
+from db import get_connection
+from embeddings import JinaEmbeddingClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -146,95 +147,6 @@ class SemanticChunker:
             return result
 
 
-# =================== Jina Embeddings Client =================== #
-
-class JinaEmbeddingClient:
-    """
-    Jina AI embeddings client for generating vectors.
-    Supports batch embeddings for efficiency.
-    """
-    
-    def __init__(self):
-        load_dotenv()
-        self.api_key = os.getenv("JINA_API_KEY")
-        if not self.api_key:
-            raise ValueError("JINA_API_KEY environment variable is required")
-        
-        self.api_url = os.getenv("JINA_API_URL", "https://api.jina.ai/v1/embeddings")
-        self.model = os.getenv("JINA_MODEL", "jina-embeddings-v3")
-        self.dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
-        self.task = os.getenv("JINA_TASK", "text-matching")
-        self.batch_size = int(os.getenv("JINA_BATCH_SIZE", "32"))
-        
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        
-        logger.info(f"Initialized JinaEmbeddingClient with model={self.model}, dimensions={self.dimensions}")
-    
-    def embed(self, text: str) -> List[float]:
-        """Generate embedding vector for a single text."""
-        embeddings = self.embed_batch([text])
-        return embeddings[0] if embeddings else []
-    
-    def embed_batch(self, texts: List[str], max_chars: int = 12000) -> List[List[float]]:
-        """
-        Generate embedding vectors for multiple texts in a single API call.
-        
-        Args:
-            texts: List of texts to embed
-            max_chars: Maximum characters per text (truncated if exceeded)
-        
-        Returns:
-            List of embedding vectors
-        """
-        if not texts:
-            return []
-        
-        # Truncate texts to max length
-        truncated_texts = [text[:max_chars] for text in texts]
-        
-        all_embeddings = []
-        
-        # Process in batches
-        for i in range(0, len(truncated_texts), self.batch_size):
-            batch = truncated_texts[i:i + self.batch_size]
-            
-            payload = {
-                "model": self.model,
-                "task": self.task,
-                "dimensions": self.dimensions,
-                "input": batch
-            }
-            
-            try:
-                response = requests.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=120
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                # Extract embeddings in order
-                batch_embeddings = [item["embedding"] for item in data["data"]]
-                all_embeddings.extend(batch_embeddings)
-                
-                logger.debug(f"Embedded batch {i // self.batch_size + 1}, {len(batch)} texts")
-                
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Jina API request failed: {e}")
-                # Return empty embeddings for failed batch
-                all_embeddings.extend([[] for _ in batch])
-            except (KeyError, IndexError) as e:
-                logger.error(f"Unexpected response format from Jina API: {e}")
-                all_embeddings.extend([[] for _ in batch])
-        
-        return all_embeddings
-
-
 # =================== Supabase Vector Store =================== #
 
 class SupabaseVectorStore:
@@ -245,27 +157,18 @@ class SupabaseVectorStore:
     """
     
     def __init__(self, table_name: Optional[str] = None):
-        load_dotenv()
-        
-        self.db_url = os.getenv("SUPABASE_DB_URL")
         self.table_name = table_name or os.getenv("VECTOR_TABLE_NAME", "document_chunks")
         self.vector_size = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
-        
-        if not self.db_url:
-            raise ValueError("SUPABASE_DB_URL environment variable is required")
-        
+
         self._ensure_table_exists()
         logger.info(f"Initialized SupabaseVectorStore with table={self.table_name}")
-    
-    def _get_connection(self):
-        """Get database connection."""
-        return psycopg2.connect(self.db_url)
-    
+
     def _ensure_table_exists(self):
         """Create the document_chunks table if it doesn't exist."""
         create_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {self.table_name} (
             id TEXT PRIMARY KEY,
+            document_id UUID,
             source_file TEXT,
             chunk_id INTEGER,
             content TEXT,
@@ -277,20 +180,22 @@ class SupabaseVectorStore:
             embedding vector({self.vector_size}),
             metadata JSONB
         );
-        
-        CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx 
-        ON {self.table_name} 
+
+        CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx
+        ON {self.table_name}
         USING ivfflat (embedding vector_cosine_ops)
         WITH (lists = 100);
+
+        CREATE INDEX IF NOT EXISTS {self.table_name}_document_id_idx
+        ON {self.table_name} (document_id);
         """
-        
+
         try:
-            conn = self._get_connection()
-            cur = conn.cursor()
-            cur.execute(create_table_sql)
-            conn.commit()
-            cur.close()
-            conn.close()
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(create_table_sql)
+                conn.commit()
+                cur.close()
             logger.info(f"Table {self.table_name} verified/created")
         except Exception as e:
             logger.error(f"Failed to create table: {e}")
@@ -344,6 +249,7 @@ class SupabaseVectorStore:
             
             data_rows.append((
                 chunk_id_hash,
+                chunk.get("document_id"),
                 chunk.get("source_file", ""),
                 chunk.get("chunk_id", 0),
                 chunk["content"],
@@ -355,40 +261,38 @@ class SupabaseVectorStore:
                 embedding,
                 json.dumps(metadata)
             ))
-        
+
         if not data_rows:
             logger.warning("No valid chunks to upsert")
             return 0
-        
-        conn = self._get_connection()
-        cur = conn.cursor()
-        
-        try:
-            # Use ON CONFLICT for idempotent upserts
-            query = f"""
-                INSERT INTO {self.table_name} 
-                (id, source_file, chunk_id, content, start_offset, end_offset, 
-                 heading_context, section, processed_date, embedding, metadata)
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    embedding = EXCLUDED.embedding,
-                    metadata = EXCLUDED.metadata,
-                    processed_date = EXCLUDED.processed_date
-            """
-            
-            execute_values(cur, query, data_rows)
-            conn.commit()
-            logger.info(f"Upserted {len(data_rows)} chunks to Supabase")
-            return len(data_rows)
-            
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Error upserting to Supabase: {e}")
-            return 0
-        finally:
-            cur.close()
-            conn.close()
+
+        with get_connection() as conn:
+            cur = conn.cursor()
+            try:
+                # Use ON CONFLICT for idempotent upserts
+                query = f"""
+                    INSERT INTO {self.table_name}
+                    (id, document_id, source_file, chunk_id, content, start_offset, end_offset,
+                     heading_context, section, processed_date, embedding, metadata)
+                    VALUES %s
+                    ON CONFLICT (id) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding,
+                        metadata = EXCLUDED.metadata,
+                        processed_date = EXCLUDED.processed_date
+                """
+
+                execute_values(cur, query, data_rows)
+                conn.commit()
+                logger.info(f"Upserted {len(data_rows)} chunks to Supabase")
+                return len(data_rows)
+
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Error upserting to Supabase: {e}")
+                return 0
+            finally:
+                cur.close()
     
     def search(
         self,
@@ -407,60 +311,58 @@ class SupabaseVectorStore:
         Returns:
             List of matching chunks with scores
         """
-        conn = self._get_connection()
-        cur = conn.cursor()
-        
-        try:
-            # Use cosine distance operator <=>
-            # Similarity = 1 - distance
-            if score_threshold is not None:
-                sql = f"""
-                    SELECT id, source_file, chunk_id, content, start_offset, end_offset,
-                           heading_context, section, processed_date, metadata,
-                           1 - (embedding <=> %s::vector) as similarity
-                    FROM {self.table_name}
-                    WHERE 1 - (embedding <=> %s::vector) >= %s
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                """
-                cur.execute(sql, (query_vector, query_vector, score_threshold, query_vector, limit))
-            else:
-                sql = f"""
-                    SELECT id, source_file, chunk_id, content, start_offset, end_offset,
-                           heading_context, section, processed_date, metadata,
-                           1 - (embedding <=> %s::vector) as similarity
-                    FROM {self.table_name}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                """
-                cur.execute(sql, (query_vector, query_vector, limit))
-            
-            rows = cur.fetchall()
-            
-            results = []
-            for row in rows:
-                results.append({
-                    "id": row[0],
-                    "source_file": row[1],
-                    "chunk_id": row[2],
-                    "content": row[3],
-                    "start_offset": row[4],
-                    "end_offset": row[5],
-                    "heading_context": row[6],
-                    "section": row[7],
-                    "processed_date": row[8],
-                    "metadata": row[9],
-                    "score": row[10]
-                })
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error searching Supabase: {e}")
-            return []
-        finally:
-            cur.close()
-            conn.close()
+        with get_connection(readonly=True) as conn:
+            cur = conn.cursor()
+            try:
+                # Use cosine distance operator <=>
+                # Similarity = 1 - distance
+                if score_threshold is not None:
+                    sql_query = f"""
+                        SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                               heading_context, section, processed_date, metadata,
+                               1 - (embedding <=> %s::vector) as similarity
+                        FROM {self.table_name}
+                        WHERE 1 - (embedding <=> %s::vector) >= %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """
+                    cur.execute(sql_query, (query_vector, query_vector, score_threshold, query_vector, limit))
+                else:
+                    sql_query = f"""
+                        SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                               heading_context, section, processed_date, metadata,
+                               1 - (embedding <=> %s::vector) as similarity
+                        FROM {self.table_name}
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """
+                    cur.execute(sql_query, (query_vector, query_vector, limit))
+
+                rows = cur.fetchall()
+
+                results = []
+                for row in rows:
+                    results.append({
+                        "id": row[0],
+                        "source_file": row[1],
+                        "chunk_id": row[2],
+                        "content": row[3],
+                        "start_offset": row[4],
+                        "end_offset": row[5],
+                        "heading_context": row[6],
+                        "section": row[7],
+                        "processed_date": row[8],
+                        "metadata": row[9],
+                        "score": row[10]
+                    })
+
+                return results
+
+            except Exception as e:
+                logger.error(f"Error searching Supabase: {e}")
+                return []
+            finally:
+                cur.close()
 
 
 # =================== Document Processor =================== #
@@ -495,7 +397,7 @@ class DocumentProcessor:
             overlap: Overlap ratio or token count
             tokenizer: Tokenizer name for semchunk
             output_dir: Directory for saving outputs
-            collection_name: Qdrant collection name
+            collection_name: Supabase vector table name
             embed_with_context: Whether to prepend heading context when embedding
         """
         self.chunk_size = chunk_size
@@ -554,40 +456,43 @@ class DocumentProcessor:
         input_path: str,
         save_chunks: bool = True,
         store_to_qdrant: bool = True,
+        document_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Process a markdown file: chunk, embed, and store.
-        
+
         Args:
             input_path: Path to the markdown file
             save_chunks: Whether to save chunks as JSON files
-            store_to_qdrant: Whether to store embeddings in Qdrant
-        
+            store_to_qdrant: Whether to store embeddings in Supabase
+            document_id: UUID of the parent document (for cross-doc queries)
+
         Returns:
             List of processed chunk dictionaries
         """
         input_path = Path(input_path)
-        
+
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
-        
+
         logger.info(f"Processing: {input_path}")
-        
+
         # Read the file
         with open(input_path, "r", encoding="utf-8") as f:
             text = f.read()
-        
+
         # Chunk the text with offsets
         chunks, offsets = self.chunker.chunk_text(text, offsets=True)
-        
+
         # Build chunk data with metadata
         chunk_data = []
         for i, (chunk_content, (start, end)) in enumerate(zip(chunks, offsets)):
             # Extract heading context for this chunk position
             heading_context = self.extract_heading_context(text, start)
-            
+
             chunk_info = {
                 "chunk_id": i,
+                "document_id": document_id,
                 "content": chunk_content,
                 "start_offset": start,
                 "end_offset": end,
