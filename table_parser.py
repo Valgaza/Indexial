@@ -369,7 +369,7 @@ class TableIngestionPipeline:
             semantic_description TEXT,
             headers JSONB,
             row_count INTEGER,
-            extracted_at TIMESTAMP DEFAULT NOW()
+            created_at TIMESTAMP DEFAULT NOW()
         );
         """
 
