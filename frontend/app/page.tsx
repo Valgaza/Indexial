@@ -43,7 +43,7 @@ export default function Home() {
           <div className="flex items-center gap-2">
             <Zap className="h-4 w-4 text-[hsl(224,76%,56%)]" />
             <span className="text-sm font-semibold text-foreground">
-              DataChat
+              Indexial
             </span>
           </div>
           <button
@@ -60,7 +60,7 @@ export default function Home() {
           <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[hsl(224,76%,56%)]/20">
             <Zap className="h-3.5 w-3.5 text-[hsl(224,76%,56%)]" />
           </div>
-          <span className="text-sm font-bold text-foreground">DataChat</span>
+          <span className="text-sm font-bold text-foreground">Indexial</span>
           <span className="ml-auto rounded-md bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
             v1.0
           </span>

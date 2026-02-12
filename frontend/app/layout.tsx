@@ -15,7 +15,7 @@ const jetbrainsMono = JetBrains_Mono({
 })
 
 export const metadata: Metadata = {
-  title: "DataChat - AI Document Assistant",
+  title: "Indexial",
   description:
     "Upload documents, query tables, and chat with your data using AI-powered SQL and RAG routing.",
 }
