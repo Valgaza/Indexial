@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
@@ -93,12 +93,6 @@ def get_document_by_id(doc_id: str) -> Optional[dict]:
 
 # =================== API Endpoints =================== #
 
-@app.route("/", methods=["GET"])
-def index():
-    """Serve the web UI."""
-    return render_template("index.html")
-
-
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint."""
@@ -155,7 +149,7 @@ def upload_document():
 
         return jsonify({
             "message": "Document uploaded and queued for processing",
-            "document_id": result["document_id"],
+            "document_id": result["doc_id"],
             "filename": filename,
             "status": result["status"],
             "skipped": result.get("skipped", False)
