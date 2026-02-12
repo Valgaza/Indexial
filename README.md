@@ -2,9 +2,9 @@
 
 An intelligent document query system that combines **RAG** (Retrieval-Augmented Generation) with **NL-to-SQL** to let users upload PDFs, extract structured tables and unstructured text, and query everything through natural language.
 
-![Indexial Chat Interface](docs/images/chat-interface.png)
+![Indexial Chat Interface](docs/images/chat-interface.jpeg)
 
-![Indexial Document Sidebar](docs/images/document-sidebar.png)
+![Indexial Document Sidebar](docs/images/document-sidebar.jpeg)
 
 ---
 
