@@ -26,7 +26,7 @@ import {
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import type { ChatMessage } from "@/lib/types"
-import { sendQuery, clearSession } from "@/lib/api"
+import { sendQuery, clearSession, resetDatabaseBeacon } from "@/lib/api"
 
 function generateSessionId() {
   return `session_${Math.random().toString(36).substring(2, 15)}_${Date.now()}`
@@ -169,6 +169,14 @@ export function ChatInterface() {
   useEffect(() => {
     scrollToBottom()
   }, [messages, scrollToBottom])
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      resetDatabaseBeacon()
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload)
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload)
+  }, [])
 
   const handleSend = async () => {
     const trimmed = input.trim()

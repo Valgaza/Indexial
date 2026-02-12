@@ -99,6 +99,13 @@ class MemoryManager:
             if session_id in self._store:
                 del self._store[session_id]
 
+    def clear_all(self) -> int:
+        """Clear ALL session histories. Returns number of sessions cleared."""
+        with self._lock:
+            count = len(self._store)
+            self._store.clear()
+            return count
+
     def session_exists(self, session_id: str) -> bool:
         """
         Check if a session has any history.

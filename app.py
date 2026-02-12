@@ -6,7 +6,10 @@ Provides endpoints for document upload, querying, and session management.
 """
 
 import os
+import shutil
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +22,7 @@ from pipeline import IngestionPipeline
 from router import QueryOrchestrator
 from memory import MemoryManager
 from db import get_connection
+from psycopg2 import sql as psql
 from sql_engine import TableRegistryReader
 
 load_dotenv()
@@ -44,6 +48,12 @@ memory_manager = MemoryManager()
 query_orchestrator = QueryOrchestrator(memory=memory_manager)
 ingestion_pipeline = IngestionPipeline()
 table_registry = TableRegistryReader()
+
+# Reset mechanism state
+_reset_lock = threading.Lock()
+_resetting = False
+_last_activity_time = time.time()
+INACTIVITY_TIMEOUT_SECONDS = int(os.getenv("INACTIVITY_TIMEOUT_SECONDS", 2 * 60 * 60))
 
 
 # =================== Helper Functions =================== #
@@ -89,6 +99,130 @@ def get_document_by_id(doc_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"Error fetching document {doc_id}: {e}")
         return None
+
+
+# =================== Middleware =================== #
+
+@app.before_request
+def track_activity():
+    """Track API activity and block requests during reset."""
+    global _last_activity_time
+    _last_activity_time = time.time()
+    if _resetting and request.endpoint not in ('health', 'reset_database'):
+        return jsonify({"error": "System is resetting. Please try again."}), 503
+
+
+# =================== Reset Function =================== #
+
+def perform_reset():
+    """
+    Core database reset. Clears all data and returns system to initial state.
+
+    Steps:
+    1. Drop all dynamic tbl_*_extracted tables
+    2. Truncate documents, document_chunks, table_registry
+    3. Clear filesystem artifacts (uploads, output)
+    4. Clear in-memory session state
+    """
+    global _resetting
+
+    with _reset_lock:
+        if _resetting:
+            return {"status": "already_resetting"}
+        _resetting = True
+
+    try:
+        summary = {
+            "tables_dropped": [],
+            "tables_truncated": [],
+            "files_removed": 0,
+            "sessions_cleared": 0,
+            "errors": [],
+        }
+
+        # Step 1: Discover dynamic tables from registry
+        dynamic_tables = []
+        try:
+            with get_connection(readonly=True) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT physical_table_name FROM table_registry")
+                dynamic_tables = [row[0] for row in cur.fetchall()]
+                cur.close()
+        except Exception as e:
+            logger.warning(f"Could not read table_registry: {e}")
+
+        # Step 2: DROP each dynamic table
+        for table_name in dynamic_tables:
+            try:
+                with get_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        psql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                            psql.Identifier(table_name)
+                        )
+                    )
+                    conn.commit()
+                    cur.close()
+                    summary["tables_dropped"].append(table_name)
+                    logger.info(f"Dropped table: {table_name}")
+            except Exception as e:
+                logger.error(f"Failed to drop table {table_name}: {e}")
+                summary["errors"].append(f"DROP {table_name}: {str(e)}")
+
+        # Step 3: TRUNCATE fixed tables
+        fixed_tables = ["document_chunks", "table_registry", "documents"]
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                for table_name in fixed_tables:
+                    try:
+                        cur.execute(f"TRUNCATE TABLE {table_name} CASCADE")
+                        summary["tables_truncated"].append(table_name)
+                        logger.info(f"Truncated table: {table_name}")
+                    except Exception as e:
+                        logger.warning(f"Could not truncate {table_name}: {e}")
+                        conn.rollback()
+                        summary["errors"].append(f"TRUNCATE {table_name}: {str(e)}")
+                conn.commit()
+                cur.close()
+        except Exception as e:
+            logger.error(f"Database truncation failed: {e}")
+            summary["errors"].append(f"TRUNCATE connection: {str(e)}")
+
+        # Step 4: Clear filesystem artifacts
+        dirs_to_clear = [
+            UPLOAD_FOLDER,
+            Path("output/markdown"),
+            Path("output/chunks"),
+        ]
+
+        files_removed = 0
+        for dir_path in dirs_to_clear:
+            if dir_path.exists():
+                for item in dir_path.iterdir():
+                    try:
+                        if item.is_file():
+                            item.unlink()
+                            files_removed += 1
+                        elif item.is_dir():
+                            shutil.rmtree(item)
+                            files_removed += 1
+                    except Exception as e:
+                        logger.error(f"Failed to remove {item}: {e}")
+                        summary["errors"].append(f"FS {item}: {str(e)}")
+
+        summary["files_removed"] = files_removed
+
+        # Step 5: Clear in-memory session state
+        sessions_cleared = memory_manager.clear_all()
+        summary["sessions_cleared"] = sessions_cleared
+
+        logger.info(f"Reset complete: {summary}")
+        return summary
+
+    finally:
+        with _reset_lock:
+            _resetting = False
 
 
 # =================== API Endpoints =================== #
@@ -319,6 +453,29 @@ def clear_session(session_id: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/reset", methods=["POST"])
+def reset_database():
+    """Reset the entire database to its initial state."""
+    try:
+        summary = perform_reset()
+
+        if summary.get("status") == "already_resetting":
+            return jsonify({
+                "message": "Reset already in progress",
+                "status": "in_progress"
+            }), 409
+
+        return jsonify({
+            "message": "Database reset complete",
+            "status": "success",
+            "summary": summary
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Reset failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/tables", methods=["GET"])
 def list_tables():
     """
@@ -393,11 +550,34 @@ def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
 
+# =================== Inactivity Timer =================== #
+
+def _inactivity_checker():
+    """Background thread that triggers reset after inactivity timeout."""
+    global _last_activity_time
+    while True:
+        time.sleep(60)  # Check every 60 seconds
+        elapsed = time.time() - _last_activity_time
+        if elapsed >= INACTIVITY_TIMEOUT_SECONDS:
+            logger.info(f"Inactivity timeout reached ({elapsed:.0f}s). Triggering reset.")
+            try:
+                perform_reset()
+                _last_activity_time = time.time()
+            except Exception as e:
+                logger.error(f"Inactivity reset failed: {e}")
+
+
 # =================== Main =================== #
 
 if __name__ == "__main__":
     port = int(os.getenv("API_PORT", 8000))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
+    # Start inactivity timer (avoid double-start with Flask reloader)
+    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        _inactivity_thread = threading.Thread(target=_inactivity_checker, daemon=True)
+        _inactivity_thread.start()
+        logger.info(f"Inactivity timer started (timeout={INACTIVITY_TIMEOUT_SECONDS}s)")
 
     logger.info(f"Starting Indexial API on port {port}")
     app.run(host="0.0.0.0", port=port, debug=debug)
