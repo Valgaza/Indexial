@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 228 15% 7%;
+    --foreground: 220 20% 93%;
+    --card: 225 15% 10%;
+    --card-foreground: 220 20% 93%;
+    --popover: 225 15% 10%;
+    --popover-foreground: 220 20% 93%;
+    --primary: 224 76% 56%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 225 14% 15%;
+    --secondary-foreground: 220 20% 85%;
+    --muted: 225 12% 14%;
+    --muted-foreground: 220 10% 55%;
+    --accent: 270 60% 58%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 225 12% 18%;
+    --input: 225 12% 18%;
+    --ring: 224 76% 56%;
+    --chart-1: 224 76% 56%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 270 60% 58%;
+    --chart-4: 340 65% 55%;
+    --chart-5: 43 74% 66%;
+    --radius: 0.75rem;
+    --sidebar-background: 228 15% 8%;
+    --sidebar-foreground: 220 20% 85%;
+    --sidebar-primary: 224 76% 56%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 225 14% 13%;
+    --sidebar-accent-foreground: 220 20% 85%;
+    --sidebar-border: 225 12% 16%;
+    --sidebar-ring: 224 76% 56%;
+
+    --glass: 225 15% 12%;
+    --glass-border: 225 12% 22%;
+    --glass-hover: 225 15% 16%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  .glass {
+    background: hsla(var(--glass) / 0.6);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid hsla(var(--glass-border) / 0.4);
+  }
+  .glass-strong {
+    background: hsla(var(--glass) / 0.8);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid hsla(var(--glass-border) / 0.5);
+  }
+  .glass-subtle {
+    background: hsla(var(--glass) / 0.3);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid hsla(var(--glass-border) / 0.25);
+  }
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(225 12% 22%);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(225 12% 30%);
+}
