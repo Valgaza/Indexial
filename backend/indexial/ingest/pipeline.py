@@ -10,20 +10,83 @@ Tracks document status in a `documents` table for dedup and monitoring.
 import hashlib
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional, Sequence
 from datetime import datetime
 
-from dotenv import load_dotenv
 
-from db import get_connection
-from extractor import MistralOCRExtractor
-from table_parser import MarkdownTableExtractor, MarkdownTableStitcher, TableIngestionPipeline
-from chunker import DocumentProcessor
+from indexial.core import config
+from indexial.core.db import get_connection
+from indexial.core.schema import ensure_schema
+from indexial.ingest.extractor import MistralOCRExtractor
+from indexial.ingest.fact_store import FactStore
+from indexial.ingest.table_parser import MarkdownTableExtractor
+from indexial.ingest.chunker import DocumentProcessor
 
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def excise_tables(
+    markdown: str,
+    tables: Sequence[Any],
+    ingested: Sequence[Dict[str, Any]],
+    sample_rows: int = 2,
+) -> str:
+    """
+    Replace table bodies in the text handed to the chunker with short stubs.
+
+    Tables used to be embedded as chunks *and* stored as SQL rows. The
+    duplication actively hurt retrieval: pipe-delimited numeric soup embeds
+    poorly, so every table's vector ends up near every other table's, and those
+    near-duplicates crowd real prose out of a top-5 search.
+
+    Deleting them outright would be worse. The RAG route cannot reach facts,
+    and the heuristic router will sometimes send a table question to RAG, which
+    would then answer "I couldn't find any relevant information". A stub keeps
+    three things: prose chunks stay contiguous, the semantic description is
+    still embedded so the right neighbourhood is still retrievable, and the
+    chunk carries table_id so a RAG hit can be upgraded into a fact query.
+    """
+    if not tables:
+        return markdown
+
+    by_index = {t["table_index"]: t for t in ingested}
+    out = markdown
+
+    for table in tables:
+        meta = by_index.get(table.table_index)
+        if not meta:
+            continue
+
+        pages = (
+            f" | page {table.page_start}"
+            if table.page_start and table.page_start == table.page_end
+            else f" | pages {table.page_start}-{table.page_end}"
+            if table.page_start
+            else ""
+        )
+        preview = "\n".join(
+            " | ".join(str(c) for c in row) for row in table.rows[:sample_rows]
+        )
+        stub = (
+            f"[TABLE {table.table_index} — {meta['description']}{pages} "
+            f"| table_id={meta['table_id']}]\n"
+            f"columns: {', '.join(table.headers)} | {len(table.rows)} rows\n"
+            f"{preview}\n"
+            + ("...\n" if len(table.rows) > sample_rows else "")
+        )
+
+        # raw_fragments holds the exact source span per page. The first becomes
+        # the stub; any continuation fragments are dropped.
+        replacement = stub
+        for fragment in table.raw_fragments:
+            fragment = fragment.strip()
+            if fragment and fragment in out:
+                out = out.replace(fragment, replacement, 1)
+                replacement = ""
+
+    return out
 
 
 class IngestionPipeline:
@@ -39,11 +102,11 @@ class IngestionPipeline:
 
     def __init__(
         self,
-        output_dir: str = "output",
+        output_dir: Optional[str] = None,
         chunk_size: int = 512,
         overlap: float = 0.1,
     ):
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir) if output_dir else config.OUTPUT_DIR
         self.markdown_dir = self.output_dir / "markdown"
         self.markdown_dir.mkdir(parents=True, exist_ok=True)
 
@@ -54,29 +117,14 @@ class IngestionPipeline:
         self._ensure_documents_table()
 
     def _ensure_documents_table(self):
-        """Create the documents tracking table if it doesn't exist."""
-        sql = """
-        CREATE TABLE IF NOT EXISTS documents (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            filename TEXT NOT NULL,
-            file_hash TEXT UNIQUE NOT NULL,
-            status TEXT DEFAULT 'pending',
-            page_count INTEGER,
-            table_count INTEGER DEFAULT 0,
-            chunk_count INTEGER DEFAULT 0,
-            error_message TEXT,
-            markdown_path TEXT,
-            uploaded_at TIMESTAMP DEFAULT NOW(),
-            completed_at TIMESTAMP,
-            metadata JSONB DEFAULT '{}'
-        );
         """
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(sql)
-            conn.commit()
-            cur.close()
-        logger.info("Documents table verified/created")
+        Create the whole schema if needed.
+
+        Delegates to core.schema, which owns every CREATE statement in the
+        project. This used to carry its own copy of the documents DDL, which
+        meant the real shape of the database was spread across three modules.
+        """
+        ensure_schema()
 
     @staticmethod
     def _compute_file_hash(file_path: str) -> str:
@@ -189,8 +237,10 @@ class IngestionPipeline:
         result = {
             "filename": pdf_path.name,
             "status": "pending",
+            "doc_id": None,
             "tables_created": [],
             "chunk_count": 0,
+            "fact_count": 0,
             "skipped": False,
         }
 
@@ -207,6 +257,9 @@ class IngestionPipeline:
 
         doc_id = self._register_document(pdf_path, file_hash)
         if doc_id is None:
+            # doc_id is seeded as None above so this early return still carries
+            # the key; app.py reads result["doc_id"] unconditionally and used
+            # to raise KeyError on any duplicate upload.
             result["status"] = "skipped"
             result["skipped"] = True
             print(f"Skipped: {pdf_path.name} (already processed)")
@@ -215,43 +268,54 @@ class IngestionPipeline:
         result["doc_id"] = doc_id
 
         try:
-            # Step 2: Extract markdown via Mistral OCR
+            # Step 2: Extract markdown via Mistral OCR, page by page
             self._update_status(doc_id, "extracting")
             print(f"\n[1/3] Extracting markdown from {pdf_path.name}...")
 
             extractor = MistralOCRExtractor()
-            md_output_path = self.markdown_dir / f"{pdf_path.stem}.md"
-            markdown_text = extractor.extract_pdf_to_markdown(
-                str(pdf_path), str(md_output_path)
-            )
+            pages = extractor.extract_pdf_pages(str(pdf_path))
+            markdown_text = extractor.pages_to_markdown(pages)
 
-            # Count pages from the markdown (separated by ---)
-            page_count = markdown_text.count("\n\n---\n\n") + 1
+            md_output_path = self.markdown_dir / f"{pdf_path.stem}.md"
+            md_output_path.parent.mkdir(parents=True, exist_ok=True)
+            md_output_path.write_text(markdown_text, encoding="utf-8")
+
+            # Exact, rather than inferred by counting a '---' separator that a
+            # horizontal rule in the document body would also match.
+            page_count = len(pages)
             self._update_status(
                 doc_id, "extracting",
                 page_count=page_count,
                 markdown_path=str(md_output_path),
             )
 
-            # Step 3: Parse & ingest tables
+            # Step 3: Parse & ingest tables as cell-level facts
             self._update_status(doc_id, "parsing_tables")
             print(f"[2/3] Extracting and ingesting tables...")
 
             table_extractor = MarkdownTableExtractor()
-            tables = table_extractor.extract_tables(markdown_text, pdf_path.name)
+            tables = table_extractor.extract_tables_from_pages(pages, pdf_path.name)
 
-            tables_created = []
+            ingested = []
             if tables:
                 logger.info(f"Found {len(tables)} tables, ingesting...")
-                pipeline = TableIngestionPipeline()
-                tables_created = pipeline.ingest_all_tables(tables, document_id=doc_id)
-                result["tables_created"] = tables_created
+                ingested = FactStore().ingest_all(tables, document_id=doc_id)
+                result["tables_created"] = [t["table_id"] for t in ingested]
+                result["fact_count"] = sum(t["fact_count"] for t in ingested)
 
-            self._update_status(doc_id, "parsing_tables", table_count=len(tables_created))
+            self._update_status(
+                doc_id, "parsing_tables",
+                table_count=len(ingested),
+                fact_count=result["fact_count"],
+            )
 
-            # Step 4: Chunk & embed text
+            # Step 4: Chunk & embed text, with table bodies replaced by stubs
             self._update_status(doc_id, "chunking")
             print(f"[3/3] Chunking and embedding text...")
+
+            chunk_source = excise_tables(markdown_text, tables, ingested)
+            chunked_path = self.markdown_dir / f"{pdf_path.stem}.chunked.md"
+            chunked_path.write_text(chunk_source, encoding="utf-8")
 
             processor = DocumentProcessor(
                 chunk_size=self.chunk_size,
@@ -260,7 +324,7 @@ class IngestionPipeline:
                 embed_with_context=True,
             )
             chunks = processor.process_markdown_file(
-                input_path=str(md_output_path),
+                input_path=str(chunked_path),
                 save_chunks=True,
                 store_to_qdrant=True,
                 document_id=doc_id,
@@ -383,7 +447,7 @@ def main():
 
     if sys.argv[1] == "--all":
         # Process all PDFs in Docs/
-        docs_dir = Path("Docs")
+        docs_dir = config.UPLOAD_DIR
         if not docs_dir.exists():
             print("Docs/ directory not found")
             sys.exit(1)

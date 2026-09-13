@@ -6,7 +6,6 @@ to split text into semantically meaningful chunks, with embedding generation
 and Supabase pgvector storage capabilities.
 """
 
-import os
 import re
 import json
 import hashlib
@@ -17,17 +16,16 @@ from typing import Optional, Callable, List, Dict, Any
 
 import semchunk
 from psycopg2.extras import execute_values
-from dotenv import load_dotenv
 
-from db import get_connection
-from embeddings import JinaEmbeddingClient
+from indexial.core import config
+from indexial.core.db import get_connection
+from indexial.providers.embeddings import JinaEmbeddingClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-load_dotenv()
 
 
 class SemanticChunker:
@@ -157,45 +155,27 @@ class SupabaseVectorStore:
     """
     
     def __init__(self, table_name: Optional[str] = None):
-        self.table_name = table_name or os.getenv("VECTOR_TABLE_NAME", "document_chunks")
-        self.vector_size = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
+        self.table_name = table_name or config.VECTOR_TABLE_NAME
+        self.vector_size = config.EMBEDDING_DIMENSIONS
 
         self._ensure_table_exists()
         logger.info(f"Initialized SupabaseVectorStore with table={self.table_name}")
 
     def _ensure_table_exists(self):
-        """Create the document_chunks table if it doesn't exist."""
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {self.table_name} (
-            id TEXT PRIMARY KEY,
-            document_id UUID,
-            source_file TEXT,
-            chunk_id INTEGER,
-            content TEXT,
-            start_offset INTEGER,
-            end_offset INTEGER,
-            heading_context TEXT,
-            section TEXT,
-            processed_date TIMESTAMP,
-            embedding vector({self.vector_size}),
-            metadata JSONB
-        );
-
-        CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx
-        ON {self.table_name}
-        USING ivfflat (embedding vector_cosine_ops)
-        WITH (lists = 100);
-
-        CREATE INDEX IF NOT EXISTS {self.table_name}_document_id_idx
-        ON {self.table_name} (document_id);
         """
+        Create the schema if needed.
+
+        Delegates to core.schema so there is one definition of the vector table
+        rather than a private copy here. That shared version also builds an
+        HNSW index instead of the ivfflat(lists=100) this used to create:
+        ivfflat has to be trained against representative data to be useful, and
+        this corpus is wiped and rebuilt constantly, so its lists were always
+        badly calibrated.
+        """
+        from indexial.core.schema import ensure_schema
 
         try:
-            with get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(create_table_sql)
-                conn.commit()
-                cur.close()
+            ensure_schema(vector_table=self.table_name, dimensions=self.vector_size)
             logger.info(f"Table {self.table_name} verified/created")
         except Exception as e:
             logger.error(f"Failed to create table: {e}")
@@ -385,7 +365,7 @@ class DocumentProcessor:
         chunk_size: int = 512,
         overlap: Optional[float | int] = 0.1,
         tokenizer: str = "gpt-4",
-        output_dir: str = "output",
+        output_dir: Optional[str] = None,
         collection_name: Optional[str] = None,
         embed_with_context: bool = True,
     ):
@@ -403,7 +383,7 @@ class DocumentProcessor:
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.tokenizer = tokenizer
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir) if output_dir else config.OUTPUT_DIR
         self.embed_with_context = embed_with_context
         
         # Initialize components
@@ -557,7 +537,7 @@ class DocumentProcessor:
 
 def chunk_markdown_file(
     input_path: str,
-    output_dir: str = "output/chunks",
+    output_dir: Optional[str] = None,
     chunk_size: int = 512,
     overlap: Optional[float | int] = 0.1,
     tokenizer: str = "gpt-4",
@@ -615,7 +595,7 @@ def chunk_markdown_file(
     
     # Save chunks if requested
     if save_chunks:
-        output_dir = Path(output_dir)
+        output_dir = Path(output_dir) if output_dir else config.CHUNKS_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Save individual chunks
@@ -640,8 +620,8 @@ def main():
     """Main function to chunk and embed trial.md file."""
     
     # Path to the trial.md file
-    input_file = "output/markdown/trial.md"
-    output_directory = "output"
+    input_file = str(config.MARKDOWN_DIR / "trial.md")
+    output_directory = str(config.OUTPUT_DIR)
     
     # Chunking parameters
     chunk_size = 512  # Maximum tokens per chunk

@@ -13,22 +13,26 @@ import re
 import json
 import uuid
 import logging
+import pathlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 from psycopg2 import sql
-from dotenv import load_dotenv
 
-from db import get_connection
-from llm import GroqSchemaGenerator
+from indexial.core import config
+from indexial.core.db import get_connection
+from indexial.ingest.extractor import (
+    PAGE_MARKER_RE,
+    page_for_offset,
+    page_spans,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-load_dotenv()
 
 
 # =================== Data Classes =================== #
@@ -55,12 +59,48 @@ class Block:
 
 @dataclass
 class ExtractedTable:
-    """Represents an extracted table with headers and rows."""
+    """
+    An extracted table, carrying the provenance needed to cite it.
+
+    row_pages runs parallel to rows: each entry is the page that row came
+    from. It has to be per-row rather than per-table, because a table stitched
+    across a page break has rows from more than one page and a citation that
+    points at the wrong page is worse than no citation at all.
+    """
+
     headers: List[str]
     rows: List[List[str]]
     source_file: str
     table_index: int
     raw_markdown: str
+    row_pages: List[int] = field(default_factory=list)
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    # The exact source spans this table was built from: one per page for a
+    # stitched table. Held as a list rather than re-split out of raw_markdown,
+    # because the join character is not recoverable once concatenated.
+    raw_fragments: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        # Keep row_pages aligned with rows even when pages are unknown: the
+        # disk-markdown path has no page information at all.
+        if not self.row_pages:
+            self.row_pages = [self.page_start or 0] * len(self.rows)
+        elif len(self.row_pages) < len(self.rows):
+            pad = self.row_pages[-1] if self.row_pages else (self.page_start or 0)
+            self.row_pages += [pad] * (len(self.rows) - len(self.row_pages))
+
+        if not self.raw_fragments and self.raw_markdown:
+            self.raw_fragments = [self.raw_markdown]
+
+    def column_count(self) -> int:
+        return len(self.headers)
+
+    def page_of(self, row_index: int) -> Optional[int]:
+        """Page for one row, or None when pages were never recovered."""
+        if 0 <= row_index < len(self.row_pages):
+            return self.row_pages[row_index] or None
+        return self.page_start
 
 
 # =================== Markdown Table Stitcher =================== #
@@ -258,10 +298,108 @@ class MarkdownTableStitcher:
 
 class MarkdownTableExtractor:
     """Extracts structured table data from processed markdown."""
-    
+
+    TABLE_PATTERN = re.compile(
+        r'(\|[^\n]+\|\n\|[-:\s|]+\|\n(?:\|[^\n]+\|\n?)+)',
+        re.MULTILINE,
+    )
+
     def __init__(self):
         self.stitcher = MarkdownTableStitcher()
-    
+
+    # ---------------------------------------------------------- page-aware --
+
+    def extract_tables_from_pages(self, pages, source_file: str) -> List[ExtractedTable]:
+        """
+        Extract tables page by page, then stitch at the object level.
+
+        This replaces stitching the concatenated markdown as a string. That
+        approach destroyed page information twice over: the page separator was
+        an anonymous '---', and the stitcher deliberately deleted it. Running
+        the extractor per page means every table knows its page before any
+        merging happens, and merging two ExtractedTables is then just list
+        concatenation.
+
+        Args:
+            pages: list of extractor.Page (number, markdown)
+            source_file: source filename for metadata
+
+        Returns:
+            Stitched ExtractedTable objects, re-indexed in document order.
+        """
+        found: List[ExtractedTable] = []
+
+        for page in pages:
+            for match in self.TABLE_PATTERN.finditer(page.markdown):
+                raw_table = match.group(1)
+                parsed = self._parse_table(raw_table)
+                if not parsed:
+                    continue
+                headers, rows = parsed
+                found.append(
+                    ExtractedTable(
+                        headers=headers,
+                        rows=rows,
+                        source_file=source_file,
+                        table_index=len(found),
+                        raw_markdown=raw_table,
+                        row_pages=[page.number] * len(rows),
+                        page_start=page.number,
+                        page_end=page.number,
+                    )
+                )
+
+        stitched = self._stitch_tables(found)
+        for index, table in enumerate(stitched):
+            table.table_index = index
+
+        logger.info(
+            f"Extracted {len(stitched)} tables from {source_file} "
+            f"({len(found)} fragments across {len(pages)} pages)"
+        )
+        return stitched
+
+    def _stitch_tables(self, tables: List[ExtractedTable]) -> List[ExtractedTable]:
+        """
+        Merge a table continuing onto the next page into its predecessor.
+
+        A continuation is recognised when the column count matches and either
+        the header repeats verbatim (in which case the repeated header row is
+        really data and gets dropped) or the fragment starts on the page
+        immediately after.
+        """
+        if not tables:
+            return []
+
+        merged: List[ExtractedTable] = [tables[0]]
+
+        for table in tables[1:]:
+            previous = merged[-1]
+            contiguous = (table.page_start or 0) - (previous.page_end or 0) in (0, 1)
+            same_width = table.column_count() == previous.column_count() and table.column_count() > 0
+
+            if not (contiguous and same_width):
+                merged.append(table)
+                continue
+
+            headers_repeat = all(
+                self.stitcher._is_similar_header(a, b)
+                for a, b in zip(previous.headers, table.headers)
+            )
+            if not headers_repeat:
+                merged.append(table)
+                continue
+
+            previous.rows.extend(table.rows)
+            previous.row_pages.extend(table.row_pages)
+            previous.page_end = table.page_end
+            previous.raw_markdown = f"{previous.raw_markdown}\n{table.raw_markdown}"
+            previous.raw_fragments.extend(table.raw_fragments)
+
+        return merged
+
+    # ------------------------------------------------------- legacy string --
+
     def extract_tables(self, markdown_content: str, source_file: str) -> List[ExtractedTable]:
         """
         Extract all tables from markdown content.
@@ -273,30 +411,37 @@ class MarkdownTableExtractor:
         Returns:
             List of ExtractedTable objects
         """
-        # First, stitch multi-page tables
+        # Page markers, if any, must be mapped BEFORE stitching: stitching
+        # removes them and shifts every offset after them.
+        spans = page_spans(markdown_content)
+        has_pages = bool(PAGE_MARKER_RE.search(markdown_content))
+
+        page_by_table: Dict[str, int] = {}
+        if has_pages:
+            for match in self.TABLE_PATTERN.finditer(markdown_content):
+                page_by_table[match.group(1)] = page_for_offset(spans, match.start())
+
+        # Stitch multi-page tables
         cleaned_content = self.stitcher.process(markdown_content)
-        
-        # Find all tables in cleaned content
+
         tables = []
-        table_pattern = re.compile(
-            r'(\|[^\n]+\|\n\|[-:\s|]+\|\n(?:\|[^\n]+\|\n?)+)',
-            re.MULTILINE
-        )
-        
-        for idx, match in enumerate(table_pattern.finditer(cleaned_content)):
+        for idx, match in enumerate(self.TABLE_PATTERN.finditer(cleaned_content)):
             raw_table = match.group(1)
             parsed = self._parse_table(raw_table)
-            
+
             if parsed:
                 headers, rows = parsed
+                page = page_by_table.get(raw_table) if has_pages else None
                 tables.append(ExtractedTable(
                     headers=headers,
                     rows=rows,
                     source_file=source_file,
                     table_index=idx,
-                    raw_markdown=raw_table
+                    raw_markdown=raw_table,
+                    page_start=page,
+                    page_end=page,
                 ))
-        
+
         logger.info(f"Extracted {len(tables)} tables from {source_file}")
         return tables
     
@@ -317,16 +462,23 @@ class MarkdownTableExtractor:
                 data_start = i + 1
                 break
         
-        # Remaining lines are data rows
+        # Remaining lines are data rows.
+        #
+        # Rows whose width does not match the header used to be dropped
+        # outright. In a long-format store there is no reason to: a short row
+        # simply yields fewer cells, and fact_store flags it as 'ragged_row'.
+        # Over-wide rows are truncated, since the extra cells have no header
+        # to be addressed by.
         rows = []
         for line in lines[data_start:]:
             row = self._parse_row(line)
-            if row and len(row) == len(headers):
-                rows.append(row)
-        
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            rows.append(row[: len(headers)] if len(row) > len(headers) else row)
+
         if not headers or not rows:
             return None
-        
+
         return headers, rows
     
     def _parse_row(self, row: str) -> List[str]:
@@ -346,252 +498,22 @@ class MarkdownTableExtractor:
         cleaned = line.replace("|", "").replace("-", "").replace(":", "").strip()
         return len(cleaned) == 0 and "-" in line
 
-
-# =================== Database Ingestion =================== #
-
-class TableIngestionPipeline:
-    """Handles database operations for table ingestion."""
-    
-    def __init__(self):
-        self.schema_generator = GroqSchemaGenerator()
-
-        # Ensure registry table exists
-        self._ensure_registry_exists()
-
-    def _ensure_registry_exists(self):
-        """Create the table_registry if it doesn't exist."""
-        create_registry_sql = """
-        CREATE TABLE IF NOT EXISTS table_registry (
-            id SERIAL PRIMARY KEY,
-            physical_table_name TEXT UNIQUE NOT NULL,
-            source_doc_uuid UUID NOT NULL,
-            original_filename TEXT,
-            semantic_description TEXT,
-            headers JSONB,
-            row_count INTEGER,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """
-
-        try:
-            with get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(create_registry_sql)
-                conn.commit()
-                cur.close()
-            logger.info("Registry table verified/created")
-        except Exception as e:
-            logger.error(f"Failed to create registry table: {e}")
-            raise
-
-    def ingest_table(self, table: ExtractedTable, document_id: Optional[str] = None) -> Optional[str]:
-        """
-        Ingest a single extracted table into the database.
-
-        Args:
-            table: ExtractedTable object
-            document_id: UUID of the parent document (from pipeline)
-
-        Returns:
-            Physical table name if successful, None otherwise
-        """
-        if not table.headers or not table.rows:
-            logger.warning("Empty table provided for ingestion")
-            return None
-
-        # Use provided document_id or generate a new one
-        doc_uuid = document_id or str(uuid.uuid4())
-        physical_table_name = f"tbl_{doc_uuid.split('-')[0]}_t{table.table_index}_extracted"
-
-        logger.info(f"--- Ingesting Table {table.table_index} from {table.source_file} ---")
-        logger.info(f"Target Table: {physical_table_name}")
-        logger.info(f"Columns: {table.headers}")
-        logger.info(f"Rows: {len(table.rows)}")
-
-        # 1. Generate schema and semantic description via Groq
-        logger.info("Generating schema via Groq...")
-        create_table_sql = self.schema_generator.generate_schema(
-            table.headers,
-            table.rows[:3],
-            physical_table_name
-        )
-        logger.info(f"Generated SQL: {create_table_sql[:100]}...")
-
-        logger.info("Generating semantic description...")
-        semantic_description = self.schema_generator.generate_semantic_description(
-            table.headers,
-            table.rows[:3]
-        )
-        logger.info(f"Description: {semantic_description}")
-
-        with get_connection() as conn:
-            cur = conn.cursor()
-            try:
-                # 2. Create the table
-                logger.info("Executing DDL...")
-                cur.execute(create_table_sql)
-
-                # 3. Insert data
-                logger.info(f"Inserting {len(table.rows)} rows...")
-
-                # Create placeholders
-                placeholders = ",".join(["%s"] * len(table.headers))
-
-                # Build insert query
-                insert_query = sql.SQL("INSERT INTO {} VALUES (DEFAULT, {})").format(
-                    sql.Identifier(physical_table_name),
-                    sql.SQL(placeholders)
-                )
-
-                cur.executemany(insert_query, table.rows)
-
-                # 4. Update registry
-                logger.info("Updating Table Registry...")
-                cur.execute("""
-                    INSERT INTO table_registry
-                    (physical_table_name, source_doc_uuid, semantic_description,
-                     original_filename, headers, row_count)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (
-                    physical_table_name,
-                    doc_uuid,
-                    semantic_description,
-                    table.source_file,
-                    json.dumps(table.headers),
-                    len(table.rows)
-                ))
-
-                conn.commit()
-                logger.info(f"Success! Table '{physical_table_name}' created with {len(table.rows)} rows")
-
-                return physical_table_name
-
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Ingestion failed: {e}")
-                return None
-            finally:
-                cur.close()
-    
-    def ingest_all_tables(self, tables: List[ExtractedTable], document_id: Optional[str] = None) -> List[str]:
-        """
-        Ingest multiple tables.
-
-        Args:
-            tables: List of ExtractedTable objects
-            document_id: UUID of the parent document (from pipeline)
-
-        Returns:
-            List of successfully created table names
-        """
-        created_tables = []
-
-        for table in tables:
-            table_name = self.ingest_table(table, document_id=document_id)
-            if table_name:
-                created_tables.append(table_name)
-        
-        return created_tables
-
-
-# =================== Main Pipeline =================== #
-
-def process_markdown_file(
-    file_path: str,
-    ingest_to_db: bool = True,
-    dry_run: bool = False
-) -> List[ExtractedTable]:
-    """
-    Main function to process a markdown file.
-    
-    Args:
-        file_path: Path to markdown file
-        ingest_to_db: Whether to ingest tables to database
-        dry_run: If True, extract tables but don't write to DB
-    
-    Returns:
-        List of extracted tables
-    """
-    file_path = Path(file_path)
-    
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-    
-    logger.info(f"Processing: {file_path}")
-    
-    # Read markdown content
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    
-    # Extract tables
-    extractor = MarkdownTableExtractor()
-    tables = extractor.extract_tables(content, file_path.name)
-    
-    if not tables:
-        logger.info("No tables found in file")
-        return []
-    
-    logger.info(f"Found {len(tables)} tables")
-    
-    # Preview tables
-    for i, table in enumerate(tables):
-        print(f"\n--- Table {i} ---")
-        print(f"Headers: {table.headers}")
-        print(f"Rows: {len(table.rows)}")
-        if table.rows:
-            print(f"Sample row: {table.rows[0]}")
-    
-    # Ingest to database
-    if ingest_to_db and not dry_run:
-        try:
-            pipeline = TableIngestionPipeline()
-            created = pipeline.ingest_all_tables(tables)
-            print(f"\n✅ Created {len(created)} tables in database")
-            for name in created:
-                print(f"   - {name}")
-        except ValueError as e:
-            print(f"\n⚠️ Database ingestion skipped: {e}")
-    elif dry_run:
-        print("\n🔍 Dry run - no database writes performed")
-    
-    return tables
-
-
-def main():
-    """CLI entry point."""
-    import sys
-    
-    # Default file path
-    default_path = "output/markdown/trial.md"
-    
-    if len(sys.argv) > 1:
-        file_path = sys.argv[1]
-        dry_run = "--dry-run" in sys.argv
-    else:
-        file_path = default_path
-        dry_run = False
-    
-    print("=" * 60)
-    print("Markdown Table Parser & Database Ingestion")
-    print("=" * 60)
-    print(f"\nFile: {file_path}")
-    print(f"Dry Run: {dry_run}")
-    print()
-    
-    try:
-        tables = process_markdown_file(file_path, ingest_to_db=True, dry_run=dry_run)
-        
-        if tables:
-            print(f"\n✅ Processed {len(tables)} tables successfully")
-        else:
-            print("\n⚠️ No tables found in the document")
-            
-    except FileNotFoundError as e:
-        print(f"❌ Error: {e}")
-    except Exception as e:
-        logger.exception("Processing failed")
-        print(f"❌ Error: {e}")
+# The database ingestion path that used to live here is gone.
+#
+# It asked Groq for a CREATE TABLE statement per extracted table and then
+# executed that string unparameterised. Table rows now go to
+# ingest/fact_store.py, which writes into one fixed schema with bound
+# parameters, so no model-authored DDL reaches the database at all.
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else str(config.MARKDOWN_DIR / "trial.md")
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    extracted = MarkdownTableExtractor().extract_tables(text, pathlib.Path(path).name)
+    print(f"{len(extracted)} table(s) in {path}")
+    for t in extracted:
+        pages = f" pages {t.page_start}-{t.page_end}" if t.page_start else ""
+        print(f"  [{t.table_index}] {len(t.rows)} rows x {t.column_count()} cols{pages}")
+        print(f"      {', '.join(t.headers)}")

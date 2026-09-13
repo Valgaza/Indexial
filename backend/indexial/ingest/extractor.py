@@ -1,12 +1,62 @@
-import base64
-import os
-import requests
-import time
-from pathlib import Path
-from dotenv import load_dotenv
+"""
+Mistral OCR extraction.
 
-# Load environment variables
-load_dotenv()
+Produces page-aware output. The page index is available only here, from the
+OCR response, and every downstream citation depends on it surviving.
+"""
+
+import base64
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple
+
+import requests
+
+from indexial.core import config
+
+# An explicit, greppable page marker. A bare '---' could not be told apart
+# from a real horizontal rule in the document body.
+PAGE_MARKER_PREFIX = "<!-- PAGE "
+PAGE_MARKER_RE = re.compile(r"<!--\s*PAGE\s*(\d+)\s*-->")
+
+
+@dataclass(frozen=True)
+class Page:
+    """One OCR'd page."""
+
+    number: int  # 1-based
+    markdown: str
+
+
+def page_spans(markdown: str) -> List[Tuple[int, int, int]]:
+    """
+    Map character offsets to page numbers.
+
+    Returns [(page_number, start_offset, end_offset)] over the marker-joined
+    markdown. Build this BEFORE any stitching: stitching removes markers and
+    shifts every offset after them.
+    """
+    matches = list(PAGE_MARKER_RE.finditer(markdown))
+    if not matches:
+        return [(1, 0, len(markdown))]
+
+    spans: List[Tuple[int, int, int]] = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+        spans.append((int(m.group(1)), start, end))
+    return spans
+
+
+def page_for_offset(spans: List[Tuple[int, int, int]], offset: int) -> int:
+    """Which page a character offset falls on."""
+    for number, start, end in spans:
+        if start <= offset < end:
+            return number
+    return spans[-1][0] if spans else 1
+
 
 class MistralOCRExtractor:
     """
@@ -15,12 +65,12 @@ class MistralOCRExtractor:
     """
 
     def __init__(self, api_key=None):
-        self.api_key = api_key or os.getenv("MISTRAL_OCR")
+        self.api_key = api_key or config.MISTRAL_API_KEY
         if not self.api_key:
-            raise ValueError("MISTRAL_OCR API key not found in environment variables")
+            raise ValueError("MISTRAL_OCR is required (set it in the repo-root .env)")
 
         # Mistral OCR endpoint
-        self.api_url = "https://api.mistral.ai/v1/ocr"
+        self.api_url = config.MISTRAL_OCR_URL
 
     def pdf_to_base64(self, pdf_path):
         """
@@ -59,7 +109,7 @@ class MistralOCRExtractor:
 
         # Build request payload
         payload = {
-            "model": "mistral-ocr-latest",
+            "model": config.MISTRAL_OCR_MODEL,
             "document": {
                 "type": "document_url",
                 "document_url": file_data_url
@@ -139,16 +189,21 @@ class MistralOCRExtractor:
         # If we exhausted all retries
         raise Exception(f"Failed to process {Path(pdf_path).name} after {max_retries} attempts")
 
-    def extract_pdf_to_markdown(self, pdf_path, output_path=None):
+    def extract_pdf_pages(self, pdf_path) -> List["Page"]:
         """
-        Extract text from PDF using Mistral OCR and save as markdown.
+        Extract the PDF as a list of (number, markdown) pages.
+
+        Mistral returns per-page structure and this is the only place the page
+        index is still available. Everything downstream that needs to cite a
+        page - fact provenance, citation preview - depends on it surviving from
+        here, so the page-aware call is the primitive and the flat-markdown
+        version below is the wrapper.
 
         Args:
             pdf_path: Path to input PDF file
-            output_path: Path to output markdown file (optional)
 
         Returns:
-            str: Combined markdown text from all pages
+            List of Page(number, markdown); number is 1-based.
         """
         pdf_path = Path(pdf_path)
 
@@ -162,15 +217,13 @@ class MistralOCRExtractor:
 
         print(f"Opening PDF: {pdf_path} ({file_size_mb:.1f}MB)")
 
-        # Send to OCR API
         result = self.ocr_pdf(pdf_path)
 
         if not result or "pages" not in result:
             raise Exception("OCR failed to return page results")
 
-        # Extract markdown from all pages and inline tables
-        markdown_pages = []
-        for page in result["pages"]:
+        pages: List[Page] = []
+        for offset, page in enumerate(result["pages"]):
             page_markdown = page.get("markdown", "")
 
             # Replace table placeholders with actual table content
@@ -185,10 +238,48 @@ class MistralOCRExtractor:
                         page_markdown = page_markdown.replace(placeholder, table_content)
 
             if page_markdown:
-                markdown_pages.append(page_markdown)
+                # Prefer the API's own index when present; fall back to order.
+                number = page.get("index")
+                number = (number + 1) if isinstance(number, int) else (offset + 1)
+                pages.append(Page(number=number, markdown=page_markdown))
 
-        # Combine all pages with separators
-        combined_markdown = "\n\n---\n\n".join(markdown_pages)
+        if "usage_info" in result:
+            processed = result["usage_info"].get("pages_processed", len(pages))
+            size = result["usage_info"].get("doc_size_bytes", 0)
+            print(f"Processed {processed} page(s), {size / 1024:.1f}KB")
+
+        return pages
+
+    @staticmethod
+    def pages_to_markdown(pages: List["Page"]) -> str:
+        """
+        Join pages with an explicit, identifiable page marker.
+
+        The previous separator was a bare '---', which is indistinguishable
+        from a genuine horizontal rule in the document body. That ambiguity
+        broke two things: page_count was inferred by counting the separator,
+        and the table stitcher deleted any '---' as a page gap.
+        """
+        return "\n\n".join(
+            f"{PAGE_MARKER_PREFIX}{page.number} -->\n\n{page.markdown}" for page in pages
+        )
+
+    def extract_pdf_to_markdown(self, pdf_path, output_path=None):
+        """
+        Extract text from PDF using Mistral OCR and save as markdown.
+
+        Thin wrapper over extract_pdf_pages() kept so the CLI and any caller
+        that just wants a string are unaffected.
+
+        Args:
+            pdf_path: Path to input PDF file
+            output_path: Path to output markdown file (optional)
+
+        Returns:
+            str: Combined markdown text from all pages
+        """
+        pages = self.extract_pdf_pages(pdf_path)
+        combined_markdown = self.pages_to_markdown(pages)
 
         # Print stats
         if "usage_info" in result:
@@ -206,7 +297,7 @@ class MistralOCRExtractor:
         return combined_markdown
 
 
-def process_all_pdfs(input_dir="Docs", output_dir="output/markdown"):
+def process_all_pdfs(input_dir=None, output_dir=None):
     """
     Process all PDF files in the input directory.
 
@@ -215,7 +306,8 @@ def process_all_pdfs(input_dir="Docs", output_dir="output/markdown"):
         output_dir: Directory to save markdown files
     """
     input_path = Path(input_dir)
-    output_path = Path(output_dir)
+    input_dir = Path(input_dir) if input_dir else config.UPLOAD_DIR
+    output_path = Path(output_dir) if output_dir else config.MARKDOWN_DIR
 
     if not input_path.exists():
         print(f"Error: Input directory not found: {input_dir}")
@@ -264,7 +356,7 @@ def main():
     """
     Main entry point - processes all PDFs in Docs/ folder.
     """
-    process_all_pdfs(input_dir="Docs", output_dir="output/markdown")
+    process_all_pdfs()
 
 
 if __name__ == "__main__":
