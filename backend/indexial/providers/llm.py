@@ -7,32 +7,35 @@ Consolidates all Groq API interactions:
 - GroqSchemaGenerator: SQL schema and description generation for table_parser
 """
 
-import os
 import re
 import json
+import time
+import random
 import logging
 from typing import List, Dict, Optional
 
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+from indexial.core import config
 
 logger = logging.getLogger(__name__)
+
+
+class GroqRateLimit(RuntimeError):
+    """Raised when Groq's rate limit could not be waited out."""
 
 
 class GroqClient:
     """Low-level Groq API wrapper for chat completions."""
 
-    def __init__(self):
-        self.api_key = os.getenv("GROQ_API_KEY")
+    def __init__(self, model: Optional[str] = None):
+        self.api_key = config.GROQ_API_KEY
         if not self.api_key:
-            raise ValueError("GROQ_API_KEY environment variable is required")
+            raise ValueError("GROQ_API_KEY is required (set it in the repo-root .env)")
 
-        self.api_url = os.getenv(
-            "GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions"
-        )
-        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        self.api_url = config.GROQ_API_URL
+        self.model = model or config.GROQ_MODEL
+        self.max_retries = config.GROQ_MAX_RETRIES
 
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -40,6 +43,22 @@ class GroqClient:
         }
 
         logger.info(f"Initialized GroqClient with model={self.model}")
+
+    @staticmethod
+    def _retry_after(response: requests.Response, attempt: int) -> float:
+        """
+        How long to wait before retrying.
+
+        Groq sends Retry-After on 429. When it is absent, back off
+        exponentially with jitter so concurrent callers do not resynchronise.
+        """
+        header = response.headers.get("retry-after") if response is not None else None
+        if header:
+            try:
+                return min(float(header), 60.0)
+            except ValueError:
+                pass
+        return min(2**attempt + random.uniform(0, 1), 60.0)
 
     def chat(
         self,
@@ -51,6 +70,11 @@ class GroqClient:
     ) -> str:
         """
         Send a chat completion request to Groq API.
+
+        Retries on 429 and 5xx. The free tier allows 8000 tokens per minute
+        across every model, and a single HYBRID query makes four calls, so
+        rate limiting is a normal operating condition here rather than an edge
+        case — an unhandled 429 would surface to the user as a failed query.
 
         Args:
             messages: List of {role, content} message dicts
@@ -72,22 +96,74 @@ class GroqClient:
         if response_format:
             payload["response_format"] = response_format
 
-        try:
-            response = requests.post(
-                self.api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Groq API request failed: {e}")
-            raise
-        except (KeyError, IndexError) as e:
-            logger.error(f"Unexpected response format from Groq: {e}")
-            raise
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=timeout,
+                )
+
+                if response.status_code == 429 or response.status_code >= 500:
+                    wait = self._retry_after(response, attempt)
+                    if attempt == self.max_retries - 1:
+                        break
+                    logger.warning(
+                        f"Groq {response.status_code}; retrying in {wait:.1f}s "
+                        f"(attempt {attempt + 1}/{self.max_retries})"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                # gpt-oss is a reasoning model: it spends tokens thinking
+                # before it emits content. When max_tokens is too small the
+                # budget is gone before any JSON appears and Groq rejects the
+                # empty generation with json_validate_failed. Retry once with
+                # a bigger budget rather than surfacing it as a dead end.
+                if response.status_code == 400 and attempt < self.max_retries - 1:
+                    try:
+                        code = response.json().get("error", {}).get("code")
+                    except ValueError:
+                        code = None
+                    if code == "json_validate_failed":
+                        payload["max_tokens"] = min(payload["max_tokens"] * 4, 8000)
+                        logger.warning(
+                            "Groq truncated its JSON; retrying with "
+                            f"max_tokens={payload['max_tokens']}"
+                        )
+                        continue
+
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"]
+
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self._retry_after(None, attempt))
+            except requests.exceptions.RequestException as e:
+                # 4xx other than 429 will not succeed on retry. Log the body:
+                # Groq puts the actual reason there, and without it a 400 is
+                # indistinguishable from any other failure.
+                detail = ""
+                if e.response is not None:
+                    try:
+                        detail = json.dumps(e.response.json().get("error", {}))[:400]
+                    except ValueError:
+                        detail = e.response.text[:400]
+                logger.error(f"Groq API request failed: {e} | {detail}")
+                raise
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected response format from Groq: {e}")
+                raise
+
+        raise GroqRateLimit(
+            f"Groq unavailable after {self.max_retries} attempts"
+            + (f": {last_error}" if last_error else " (rate limited)")
+        )
 
 
 class GroqLLM(GroqClient):
