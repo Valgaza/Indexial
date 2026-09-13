@@ -27,6 +27,7 @@ import {
 import { Button } from "@/components/ui/button"
 import type { ChatMessage } from "@/lib/types"
 import { sendQuery, clearSession, resetDatabaseBeacon } from "@/lib/api"
+import { ArtifactRenderer } from "@/components/artifact-renderer"
 
 function generateSessionId() {
   return `session_${Math.random().toString(36).substring(2, 15)}_${Date.now()}`
@@ -86,11 +87,18 @@ const routeConfig = {
 
 function ChatMessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user"
+  // A 25-bar chart is unreadable at 85% of a chat column, so widen the bubble
+  // only when there is actually an artifact inside it.
+  const hasArtifact = !isUser && (message.artifacts?.length ?? 0) > 0
 
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`max-w-[85%] lg:max-w-[75%] ${
+        className={`${
+          hasArtifact
+            ? "w-full max-w-[min(760px,95%)]"
+            : "max-w-[85%] lg:max-w-[75%]"
+        } ${
           isUser
             ? "rounded-2xl rounded-br-md bg-[hsl(224,76%,56%)] px-4 py-2.5 text-[hsl(0,0%,100%)]"
             : "glass rounded-2xl rounded-bl-md px-4 py-3"
@@ -128,6 +136,13 @@ function ChatMessageBubble({ message }: { message: ChatMessage }) {
         >
           {message.content}
         </p>
+
+        {/* Order is prose -> artifact -> SQL. The SQL is provenance for the
+            chart above it, so it reads last. */}
+        {!isUser &&
+          message.artifacts?.map((artifact) => (
+            <ArtifactRenderer key={artifact.id} artifact={artifact} />
+          ))}
 
         {!isUser && message.sql && (
           <CodeBlock code={message.sql} />
@@ -205,6 +220,7 @@ export function ChatInterface() {
         tables_used: response.tables_used,
         rewritten_query: response.rewritten_query,
         sources: response.sources,
+        artifacts: response.artifacts,
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, assistantMessage])
