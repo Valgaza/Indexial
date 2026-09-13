@@ -1,102 +1,111 @@
 # Indexial
 
-An intelligent document query system that combines **RAG** (Retrieval-Augmented Generation) with **NL-to-SQL** to let users upload PDFs, extract structured tables and unstructured text, and query everything through natural language.
+Ask questions about your PDFs and get answers with charts attached — where every
+number comes from SQL over extracted table data, and no language model ever draws
+the chart.
 
-![Indexial Chat Interface](Docs/images/chat-interface.jpeg)
+![Indexial Chat Interface](docs/images/chat-interface.jpeg)
 
-![Indexial Document Sidebar](Docs/images/document-sidebar.jpeg)
+![Indexial Document Sidebar](docs/images/document-sidebar.jpeg)
+
+---
+
+## What it does
+
+Upload a PDF. Indexial OCRs it, pulls out the tables, stores every cell as a fact
+with its row, column and page, and embeds the prose into pgvector. Then you ask
+questions in plain language and it decides whether the answer lives in the tables
+(SQL), the text (RAG), or both.
+
+Numeric answers come back with a chart or table built from the actual result set.
+
+## Two design decisions worth knowing about
+
+**Charts are chosen by the shape of the data, not by the model.** A classifier
+reads the result set — column types from Postgres type OIDs, row counts, whether
+there is a time axis — and picks from a fixed catalogue. `query/artifacts.py`
+imports no LLM, no database and no HTTP client, and a test enforces that by parsing
+its own imports. Because nothing generative sits between the verified rows and the
+pixels, a chart cannot misrepresent the data; the worst it can do is pick a duller
+chart than you would have.
+
+**All table data lives in one table.** Every extracted cell becomes a row in
+`document_facts` with `(document_id, table_id, row_index, col_index, page_number,
+column_key, row_label, value_text, value_num, unit, value_type)`. Earlier versions
+asked the LLM to write a `CREATE TABLE` per extracted table, which meant the SQL
+prompt grew with every upload, cross-document questions needed a join between two
+schemas the model had just invented, and no row index or page was recorded anywhere.
+
+That choice has a real cost: aggregation over long-format data needs a pivot. It is
+paid for in `query/sql_templates.py` — because the schema never changes, the model
+fills slots in a canned query pattern instead of composing SQL, and Python renders
+parameterised SQL from a template.
 
 ---
 
 ## Architecture
 
 ```
-PDF Upload
-    |
-    v
-Mistral OCR --> Markdown Extraction
-    |
-    +--> Table Extraction --> Dynamic PostgreSQL Tables + Table Registry
-    |
-    +--> Text Chunking --> Jina Embeddings (1024-dim) --> pgvector Storage
-    |
-    v
-Natural Language Query
-    |
-    v
-Heuristic + LLM Query Router
-    |
-    +--> SQL Path ----> LLM generates SQL --> Six-Layer Safety --> Execute
-    |
-    +--> RAG Path ----> Semantic Search --> Context Assembly --> LLM Answer
-    |
-    +--> HYBRID -----> Both paths merged
-    |
-    v
-Response with Sources, SQL, and Explanation
+PDF
+ └─ Mistral OCR ──► pages (markdown, page numbers preserved)
+      ├─ tables ──► stitched across page breaks ──► document_facts   (one row per cell)
+      │                                             table_registry   (catalogue)
+      └─ prose  ──► semantic chunks ──► Jina v3 ──► document_chunks  (pgvector, HNSW)
+
+question
+ └─ router: heuristics ──► LLM fallback ──► SQL | RAG | HYBRID
+      ├─ SQL  ──► catalogue lookup ──► slot filling ──► template ──► AST validation ──► execute
+      │            └─ shape classifier ──► chart / table / scalar
+      ├─ RAG  ──► cosine search over pgvector ──► answer with sources
+      └─ HYBRID ──► both, merged (artifact flagged as computed, prose as merged)
 ```
 
-## Key Features
+### Safety on generated SQL
 
-### Intelligent Query Routing
-Queries are classified into **SQL**, **RAG**, or **HYBRID** paths using a two-phase system: fast heuristic pattern matching followed by LLM-based classification as a fallback. Queries about numbers, comparisons, and aggregations route to SQL. Conceptual and descriptive queries route to RAG. Ambiguous queries run both.
+Validation runs on a parsed AST (`sqlglot`), not regexes:
 
-### Six-Layer SQL Safety
-LLM-generated SQL passes through six validation layers before execution:
-1. **Keyword Blocklist** -- Rejects DML/DDL keywords (INSERT, DROP, ALTER, etc.)
-2. **Statement Validation** -- Only SELECT statements allowed
-3. **Table Whitelisting** -- Queries restricted to tables present in the registry
-4. **Read-Only Connection** -- Database connection enforced as read-only at the driver level
-5. **Row Limits** -- Results capped to prevent memory exhaustion
-6. **Query Timeouts** -- Execution time bounded to prevent long-running queries
-
-### Automatic Table Extraction and Ingestion
-Tables found in PDFs are automatically extracted, stitched across page boundaries (handling multi-page tables), and loaded into dedicated PostgreSQL tables with LLM-generated schemas. Each table is registered with semantic descriptions for natural language discovery.
-
-### Session-Aware Conversations
-Per-session memory tracks conversation history and automatically rewrites follow-up queries into standalone questions. Asking "What about last year?" after a revenue query becomes "What was the revenue last year?" -- enabling multi-turn conversations without losing context.
-
-### Semantic Search with pgvector
-Text is chunked with heading and section context preserved, embedded using Jina AI (1024 dimensions), and stored in PostgreSQL with pgvector. Retrieval uses cosine similarity with configurable score thresholds.
-
-### Automatic Database Lifecycle Management
-The system auto-resets after 2 hours of inactivity via a background timer thread, and on browser tab close via `navigator.sendBeacon`. All extracted tables, embeddings, documents, and uploaded files are cleaned up, returning the system to a fresh state.
+1. Exactly one statement — `SELECT 1; DROP TABLE documents` has one semicolon and
+   used to pass a `count(";") > 1` check
+2. Read-only root node
+3. No write nodes or filesystem/network functions anywhere in the tree — a column
+   named `update` is a column, not an `UPDATE`
+4. Relations whitelisted by exact name — the old check accepted anything beginning
+   with `tbl_`
+5. A mandatory `table_id` / `document_id` predicate — long format has no implicit
+   scope, so an unscoped query would read every document at once
+6. Outermost `LIMIT` only, a read-only session, and a statement timeout
 
 ---
 
-## Tech Stack
+## Stack
 
 | Layer | Technology |
-|-------|-----------|
-| LLM | Groq (Llama 3.1 8B Instant) |
-| OCR | Mistral (Pixtral) |
-| Embeddings | Jina AI (jina-embeddings-v3, 1024-dim) |
-| Database | Supabase PostgreSQL + pgvector |
-| Backend | Flask + Flask-CORS |
-| Frontend | Next.js 16 + shadcn/ui + Tailwind CSS |
+|---|---|
+| LLM | Groq `openai/gpt-oss-20b` |
+| OCR | Mistral `mistral-ocr-latest` |
+| Embeddings | Jina `jina-embeddings-v3` (1024-dim) |
+| Database | Supabase PostgreSQL + pgvector (HNSW) + pg_trgm |
+| SQL safety | sqlglot AST validation |
+| Backend | Flask + flask-cors, Python 3.12 |
+| Frontend | Next.js 16, React 19, Tailwind, Radix/shadcn, Recharts |
 
 ---
 
-## Project Structure
+## Layout
 
 ```
 indexial/
-├── app.py              # Flask REST API (8 endpoints)
-├── router.py           # Query classification and orchestration
-├── sql_engine.py       # NL-to-SQL generation + six-layer safety
-├── retrieval.py        # Semantic search over pgvector
-├── chunker.py          # Text chunking + embedding storage
-├── table_parser.py     # Table extraction, stitching, and ingestion
-├── pipeline.py         # End-to-end document processing pipeline
-├── extractor.py        # Mistral OCR extraction
-├── embeddings.py       # Jina AI embedding client
-├── llm.py              # Groq LLM client (SQL gen, classification, answers)
-├── memory.py           # Thread-safe session conversation memory
-├── db.py               # PostgreSQL connection management
-└── frontend/           # Next.js application
-    ├── app/            # Pages and layout
-    ├── components/     # UI components (chat, sidebar, tables view)
-    └── lib/            # API client and type definitions
+├── backend/
+│   ├── indexial/
+│   │   ├── api/          Flask app and endpoints
+│   │   ├── core/         config, database, schema (all DDL)
+│   │   ├── ingest/       OCR, table extraction, cell parsing, fact storage, chunking
+│   │   ├── query/        routing, SQL generation, validation, retrieval, artifacts
+│   │   └── providers/    Groq and Jina clients
+│   ├── tests/
+│   └── scripts/          manual smoke scripts
+├── frontend/             Next.js app
+└── docs/
 ```
 
 ---
@@ -104,65 +113,90 @@ indexial/
 ## Setup
 
 ### Prerequisites
-- Python 3.11+
-- Node.js 18+
-- A Supabase project with pgvector enabled
 
-### Environment Variables
+- Python 3.12+, Node 18+, [uv](https://docs.astral.sh/uv/)
+- A Supabase project (or any Postgres 15+)
 
-Create a `.env` file in the root directory:
-
-```env
-SUPABASE_DB_URL=postgresql://...
-GROQ_API_KEY=gsk_...
-JINA_API_KEY=jina_...
-MISTRAL_API_KEY=...
-```
-
-### Backend
+### Configure
 
 ```bash
-# Install dependencies
-uv sync  # or pip install -r requirements.txt
-
-# Start the API server
-uv run python app.py
+cp .env.example .env
 ```
 
-The API runs on `http://localhost:8000` by default.
+Fill in `DIRECT_URL`, `GROQ_API_KEY`, `JINA_API_KEY` and `MISTRAL_OCR`.
+`.env.example` documents each one. Two things that will otherwise cost you an hour:
 
-### Frontend
+- **Use the session pooler (port 5432), not the transaction pooler (6543).** The
+  code relies on session-scoped state — `set_session(readonly=True)` and
+  `SET statement_timeout` — which pgbouncer's transaction pooling does not keep.
+- **Percent-encode special characters in the password.** An unencoded `@` makes
+  every URL parser split at the wrong place; encode it as `%40`.
+
+Then verify everything before running anything:
 
 ```bash
-cd frontend
+cd backend
+uv sync --extra dev
+uv run python -m indexial.core.config
+```
+
+That probes all four providers and prints a pass/fail table.
+
+### Run
+
+```bash
+# backend, from backend/
+uv run python -m indexial.core.schema     # create tables (idempotent)
+uv run python -m indexial.api.app         # http://localhost:8000
+
+# frontend, from frontend/
 npm install --legacy-peer-deps
-npm run dev
+npm run dev                               # http://localhost:3000
 ```
 
-The frontend runs on `http://localhost:3000` and proxies API calls to the backend.
+There is no Next.js proxy; the frontend calls the API cross-origin and the backend
+sets CORS. Point it elsewhere with `NEXT_PUBLIC_API_URL`.
+
+### Test
+
+```bash
+cd backend && uv run pytest
+```
+
+The suite needs no database and no API keys: cell parsing, SQL validation and
+artifact classification are all pure functions.
 
 ---
 
-## API Endpoints
+## API
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
+|---|---|---|
 | GET | `/health` | Health check |
-| POST | `/api/documents/upload` | Upload a PDF for processing |
-| GET | `/api/documents` | List all documents (with optional status filter) |
-| GET | `/api/documents/<id>` | Get document details |
-| POST | `/api/query` | Execute a natural language query |
-| POST | `/api/sessions/<id>/clear` | Clear session conversation history |
-| POST | `/api/reset` | Reset entire database to initial state |
-| GET | `/api/tables` | List all extracted tables |
+| POST | `/api/documents/upload` | Upload a PDF (multipart field `file`) |
+| GET | `/api/documents` | List documents and processing status |
+| GET | `/api/documents/<id>` | One document |
+| POST | `/api/query` | Ask a question |
+| GET | `/api/tables` | List extracted tables |
+| POST | `/api/sessions/<id>/clear` | Clear conversation history |
+| POST | `/api/reset` | Wipe everything |
+
+`/api/query` always returns `answer`, `route`, `query`, `original_query` and
+`artifacts` (possibly empty). Everything else varies by route.
+
+An artifact carries its own provenance — the SQL that produced it, the true row
+count, whether the data was truncated, and `answer_is_llm_merged`, which is true on
+HYBRID where the prose is a model merge while the artifact is not.
 
 ---
 
-## Usage
+## Notes
 
-1. **Upload** a PDF through the sidebar. The system extracts text and tables automatically.
-2. **Query** in natural language. The router picks the best execution path:
-   - *"What was the total revenue in Q3?"* --> SQL
-   - *"Summarize the key findings"* --> RAG
-   - *"Compare the revenue figures with the report conclusions"* --> HYBRID
-3. **Follow up** naturally. Session memory resolves pronouns and references from prior turns.
+Uploaded documents are **ephemeral by design**. Everything is wiped after two hours
+of inactivity and when the browser tab closes. `INACTIVITY_TIMEOUT_SECONDS` controls
+the timer.
+
+Groq's free tier allows 8000 tokens per minute, and a HYBRID query makes four model
+calls, so rate limiting is a normal operating condition rather than an edge case.
+The client backs off and retries on 429, and retries once with a larger budget when
+a reasoning model spends its whole allowance thinking before emitting any JSON.

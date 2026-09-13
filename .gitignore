@@ -82,6 +82,10 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# Planning notes, kept locally
+PLAN.md
+docs/PLAN.md
+
 # Editors and OS
 .DS_Store
 .idea/
