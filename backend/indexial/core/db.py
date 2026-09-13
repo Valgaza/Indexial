@@ -2,28 +2,22 @@
 Shared Database Module
 
 Provides context-managed PostgreSQL connections for all modules.
-Centralizes connection logic to eliminate duplication across
-table_parser.py, chunker.py, and retrieval.py.
+
+The DSN is resolved once in core.config, which prefers DIRECT_URL (session
+mode) because both settings used here — readonly and statement_timeout — are
+session-scoped and are not preserved by a transaction pooler.
 """
 
-import os
 import logging
 from contextlib import contextmanager
 
 import psycopg2
-from dotenv import load_dotenv
 
-load_dotenv()
+from indexial.core.config import get_db_url
 
 logger = logging.getLogger(__name__)
 
-
-def get_db_url() -> str:
-    """Get database URL from environment."""
-    db_url = os.getenv("SUPABASE_DB_URL")
-    if not db_url:
-        raise ValueError("SUPABASE_DB_URL environment variable is required")
-    return db_url
+__all__ = ["get_db_url", "get_connection", "get_cursor"]
 
 
 @contextmanager

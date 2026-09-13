@@ -1,0 +1,48 @@
+[project]
+name = "indexial"
+version = "0.2.0"
+description = "RAG + NL-to-SQL over PDFs: semantic chunking, fact extraction, and deterministic answer artifacts"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv==1.1.1",
+    "flask==3.1.2",
+    "flask-cors>=4.0.0",
+    "psycopg2-binary>=2.9.9",
+    "semchunk>=3.0.0",
+    "tiktoken>=0.5.0",
+    "requests>=2.32.5",
+    "pydantic>=2.5.0",
+    "python-dateutil>=2.8.2",
+    # AST-based SQL validation. Replaces three regex checks in query/sql_engine.py
+    # that were each independently bypassable.
+    "sqlglot>=25.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["indexial"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+# -----------------------------------------------------------------------------
+# Running this project
+# -----------------------------------------------------------------------------
+#   uv sync                                  install dependencies
+#   uv run python -m indexial.core.config    probe every credential, pass/fail
+#   uv run python -m indexial.api.app        start the API on :8000
+#   uv run pytest                            run the test suite
+#
+# All commands run from backend/. The .env lives at the repository root, one
+# level up; core/config.py resolves it explicitly, so the working directory
+# does not matter.
+# -----------------------------------------------------------------------------

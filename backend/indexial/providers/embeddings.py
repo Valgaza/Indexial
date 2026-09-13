@@ -5,14 +5,12 @@ Single canonical JinaEmbeddingClient used by all modules.
 Based on the batch-capable version from chunker.py.
 """
 
-import os
 import logging
 from typing import List
 
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+from indexial.core import config
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +22,15 @@ class JinaEmbeddingClient:
     """
 
     def __init__(self):
-        self.api_key = os.getenv("JINA_API_KEY")
+        self.api_key = config.JINA_API_KEY
         if not self.api_key:
-            raise ValueError("JINA_API_KEY environment variable is required")
+            raise ValueError("JINA_API_KEY is required (set it in the repo-root .env)")
 
-        self.api_url = os.getenv("JINA_API_URL", "https://api.jina.ai/v1/embeddings")
-        self.model = os.getenv("JINA_MODEL", "jina-embeddings-v3")
-        self.dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
-        self.task = os.getenv("JINA_TASK", "text-matching")
-        self.batch_size = int(os.getenv("JINA_BATCH_SIZE", "32"))
+        self.api_url = config.JINA_API_URL
+        self.model = config.JINA_MODEL
+        self.dimensions = config.EMBEDDING_DIMENSIONS
+        self.task = config.JINA_TASK
+        self.batch_size = config.JINA_BATCH_SIZE
 
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",

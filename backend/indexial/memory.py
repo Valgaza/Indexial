@@ -5,14 +5,11 @@ Thread-safe per-session conversational buffer memory for multi-turn conversation
 Stores the last N turns (user + assistant) to enable follow-up query rewriting.
 """
 
-import os
 import threading
 from collections import defaultdict, deque
 from typing import List, Dict
 
-from dotenv import load_dotenv
-
-load_dotenv()
+from indexial.core import config
 
 
 class MemoryManager:
@@ -35,8 +32,8 @@ class MemoryManager:
             max_turns: Maximum conversation turns to store (default from env or 6)
             max_msg_chars: Maximum characters per message (default from env or 2000)
         """
-        self.max_turns = int(os.getenv("MEMORY_MAX_TURNS", "6")) if max_turns is None else max_turns
-        self.max_msg_chars = int(os.getenv("MEMORY_MAX_CHARS", "2000")) if max_msg_chars is None else max_msg_chars
+        self.max_turns = config.MEMORY_MAX_TURNS if max_turns is None else max_turns
+        self.max_msg_chars = config.MEMORY_MAX_CHARS if max_msg_chars is None else max_msg_chars
 
         # Store: session_id -> deque of {role, content} dicts
         # deque maxlen = max_turns * 2 (user + assistant per turn)
