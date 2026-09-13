@@ -6,22 +6,20 @@ This module handles:
 - Answer generation using Groq LLM (Llama 3.1)
 """
 
-import os
 import logging
 from typing import List, Dict, Any, Optional
 
-from dotenv import load_dotenv
 
-from db import get_connection
-from embeddings import JinaEmbeddingClient
-from llm import GroqLLM
+from indexial.core import config
+from indexial.core.db import get_connection
+from indexial.providers.embeddings import JinaEmbeddingClient
+from indexial.providers.llm import GroqLLM
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-load_dotenv()
 
 
 # =================== Retriever =================== #
@@ -32,7 +30,7 @@ class Retriever:
     """
 
     def __init__(self, table_name: Optional[str] = None):
-        self.table_name = table_name or os.getenv("VECTOR_TABLE_NAME", "document_chunks")
+        self.table_name = table_name or config.VECTOR_TABLE_NAME
 
         # Initialize clients
         self.embedder = JinaEmbeddingClient()
@@ -45,6 +43,7 @@ class Retriever:
         query: str,
         limit: int = 5,
         score_threshold: Optional[float] = None,
+        document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar chunks in Supabase using cosine similarity.
@@ -53,46 +52,48 @@ class Retriever:
             query: Search query
             limit: Maximum number of results
             score_threshold: Minimum similarity score
+            document_ids: Restrict the search to these documents. The router
+                used to accept this parameter and never apply it, so scoping a
+                question to one document silently searched the whole corpus.
 
         Returns:
             List of matching chunks with scores
         """
-        # Generate query embedding
         query_vector = self.embedder.embed(query)
         if not query_vector:
             logger.error("Failed to generate query embedding")
             return []
 
+        conditions = []
+        params: List[Any] = [query_vector]  # similarity projection
+
+        if score_threshold is not None:
+            conditions.append("1 - (embedding <=> %s::vector) >= %s")
+            params.extend([query_vector, score_threshold])
+
+        if document_ids:
+            conditions.append("document_id::text = ANY(%s)")
+            params.append(list(document_ids))
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.extend([query_vector, limit])  # ordering, then limit
+
+        sql = f"""
+            SELECT id, source_file, chunk_id, content, start_offset, end_offset,
+                   heading_context, section, processed_date, metadata, page_number,
+                   1 - (embedding <=> %s::vector) as similarity
+            FROM {self.table_name}
+            {where}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """
+
         with get_connection(readonly=True) as conn:
             cur = conn.cursor()
             try:
-                if score_threshold is not None:
-                    sql = f"""
-                        SELECT id, source_file, chunk_id, content, start_offset, end_offset,
-                               heading_context, section, processed_date, metadata,
-                               1 - (embedding <=> %s::vector) as similarity
-                        FROM {self.table_name}
-                        WHERE 1 - (embedding <=> %s::vector) >= %s
-                        ORDER BY embedding <=> %s::vector
-                        LIMIT %s
-                    """
-                    cur.execute(sql, (query_vector, query_vector, score_threshold, query_vector, limit))
-                else:
-                    sql = f"""
-                        SELECT id, source_file, chunk_id, content, start_offset, end_offset,
-                               heading_context, section, processed_date, metadata,
-                               1 - (embedding <=> %s::vector) as similarity
-                        FROM {self.table_name}
-                        ORDER BY embedding <=> %s::vector
-                        LIMIT %s
-                    """
-                    cur.execute(sql, (query_vector, query_vector, limit))
-
-                rows = cur.fetchall()
-
-                results = []
-                for row in rows:
-                    results.append({
+                cur.execute(sql, params)
+                return [
+                    {
                         "id": row[0],
                         "source_file": row[1],
                         "chunk_id": row[2],
@@ -103,10 +104,11 @@ class Retriever:
                         "section": row[7],
                         "processed_date": row[8],
                         "metadata": row[9],
-                        "score": row[10]
-                    })
-
-                return results
+                        "page_number": row[10],
+                        "score": row[11],
+                    }
+                    for row in cur.fetchall()
+                ]
 
             except Exception as e:
                 logger.error(f"Supabase search failed: {e}")
@@ -244,7 +246,7 @@ def test_supabase_connection():
     print("Testing Supabase Connection")
     print("=" * 50)
 
-    table_name = os.getenv("VECTOR_TABLE_NAME", "document_chunks")
+    table_name = config.VECTOR_TABLE_NAME
 
     try:
         with get_connection(readonly=True) as conn:

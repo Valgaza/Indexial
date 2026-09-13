@@ -15,14 +15,13 @@ import json
 import logging
 from typing import Dict, Any, List, Optional, Literal
 
-from dotenv import load_dotenv
 
-from sql_engine import SQLGenerator, SafeSQLExecutor, TableRegistryReader
-from retrieval import Retriever
-from llm import GroqLLM
-from memory import MemoryManager
+from indexial.query import artifacts
+from indexial.query.sql_engine import SQLGenerator, SafeSQLExecutor, TableRegistryReader
+from indexial.query.retrieval import Retriever
+from indexial.providers.llm import GroqLLM
+from indexial.memory import MemoryManager
 
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,6 +82,32 @@ class QueryRouter:
         r"\bprocess\b",
     ]
 
+    # Visualisation wording. Deliberately NOT added to SQL_SIGNALS: chart
+    # choice is data-driven, but *reaching* the data is intent-driven, and
+    # "plot revenue over time" matches none of the 20 SQL signals. These break
+    # a one-weak-signal tie and never force a route on their own.
+    VIZ_SIGNALS = [
+        r"\bchart\b",
+        r"\bplot\b",
+        r"\bgraph\b",
+        r"\bvisuali[sz]e\b",
+        r"\btrend\b",
+        r"\bover time\b",
+        r"\bbreakdown\b",
+        r"\bdistribution\b",
+        r"\bby (month|quarter|year|region|category|segment|department)\b",
+        r"\btop \d+\b",
+    ]
+
+    # Phrases that mean "a picture printed in the document", not "draw me one".
+    # Without this veto, "explain the graph in Figure 3" would be sent to the
+    # SQL engine and come back empty.
+    VIZ_DOC_REFS = [
+        r"\bfigure\s*\d",
+        r"\b(figure|graph|chart|table)\s+(on|in)\s+(page|section)\b",
+        r"\bthe (graph|chart|figure) (shows|shown|above|below)\b",
+    ]
+
     def __init__(self):
         self.llm = GroqLLM()
         self.registry_reader = TableRegistryReader()
@@ -120,6 +145,15 @@ class QueryRouter:
                 logger.info("Heuristic: SQL (strong single match)")
                 return "SQL"
 
+        # Visualisation wording as a tie-breaker only. A viz word alone never
+        # forces SQL, and a reference to a figure printed in the document vetoes.
+        viz_matches = sum(1 for p in self.VIZ_SIGNALS if re.search(p, query_lower))
+        refers_to_printed_figure = any(re.search(p, query_lower) for p in self.VIZ_DOC_REFS)
+
+        if viz_matches and sql_matches >= 1 and rag_matches == 0 and not refers_to_printed_figure:
+            logger.info(f"Heuristic: SQL (viz tie-break, viz={viz_matches}, sql={sql_matches})")
+            return "SQL"
+
         # Ambiguous - fall back to LLM
         logger.info(f"Heuristic: AMBIGUOUS (sql={sql_matches}, rag={rag_matches})")
         return None
@@ -156,10 +190,11 @@ Rules:
 4. Return JSON format: {"route": "SQL"|"RAG"|"HYBRID", "reasoning": "brief explanation"}
 
 Available Tables:
-{table_context}
+__TABLE_CONTEXT__
 
 Example classifications:
 - "How many rows in table X?" → SQL
+- "Show revenue by segment" → SQL
 - "Explain the methodology" → RAG
 - "What do the revenue figures tell us about market trends?" → HYBRID
 """
@@ -172,12 +207,24 @@ Classify this query as SQL, RAG, or HYBRID. Return JSON only."""
         try:
             response = self.llm.chat(
                 messages=[
-                    {"role": "system", "content": system_prompt.format(table_context=table_context[:1000])},
+                    # A plain replace, not .format(). The prompt contains a
+                    # literal JSON example - {"route": "SQL"|...} - and
+                    # str.format reads those braces as a field, raising
+                    # KeyError('"route"'). Classification then silently fell
+                    # back to RAG for every ambiguous query, which is how a
+                    # question like "show revenue by segment" reached the text
+                    # retriever instead of the SQL engine.
+                    {
+                        "role": "system",
+                        "content": system_prompt.replace(
+                            "__TABLE_CONTEXT__", table_context[:1000]
+                        ),
+                    },
                     {"role": "user", "content": user_message}
                 ],
                 temperature=0,
                 response_format={"type": "json_object"},
-                max_tokens=200
+                max_tokens=1500
             )
 
             # Parse JSON response
@@ -300,7 +347,10 @@ class QueryOrchestrator:
         if session_id:
             self.memory.add_exchange(session_id, original_query, result.get("answer", ""))
 
-        # Add original query to result
+        # `artifacts` is guaranteed on every route so a client never has to
+        # test for the key. One line here covers all six early-return branches
+        # across the three _execute_* methods.
+        result.setdefault("artifacts", [])
         result["original_query"] = original_query
         if original_query != query:
             result["rewritten_query"] = query
@@ -315,19 +365,31 @@ class QueryOrchestrator:
         """Execute SQL-only query."""
         logger.info("Executing SQL route")
 
-        # Generate SQL
-        sql_result = self.sql_generator.generate_sql(query, document_ids)
+        sql_result = self.sql_generator.generate(query, document_ids)
 
         if not sql_result.get("sql"):
             return {
                 "answer": sql_result.get("explanation", "Could not generate SQL for this query."),
                 "route": "SQL",
                 "error": sql_result.get("error"),
-                "query": query
+                "artifacts": [],
+                "query": query,
             }
 
-        # Execute SQL
-        exec_result = self.sql_executor.execute(sql_result["sql"])
+        params = sql_result.get("params")
+        exec_result = self.sql_executor.execute(sql_result["sql"], params)
+
+        # One self-repair attempt. Free-form SQL only: a template that failed
+        # is a bug here, not something the model can fix.
+        if not exec_result["success"] and sql_result.get("pattern") == "custom":
+            repaired = self.sql_generator.repair(
+                sql_result["sql"], exec_result.get("error", ""), query
+            )
+            if repaired:
+                logger.info("Retrying with repaired SQL")
+                exec_result = self.sql_executor.execute(repaired)
+                if exec_result["success"]:
+                    sql_result["sql"] = repaired
 
         if not exec_result["success"]:
             return {
@@ -335,20 +397,34 @@ class QueryOrchestrator:
                 "route": "SQL",
                 "error": exec_result.get("error"),
                 "sql": sql_result["sql"],
-                "query": query
+                "artifacts": [],
+                "query": query,
             }
 
-        # Format results as natural language
-        answer = self.sql_executor.format_results(exec_result, query)
+        # Build the artifact BEFORE the prose, so both describe the same
+        # sanitised values rather than the chart saying 4.53 and the text 4.5.
+        arts = artifacts.build_artifact(
+            exec_result,
+            sql=exec_result.get("sql_executed"),
+            tables_used=sql_result.get("tables_used", []),
+            title=query,
+        )
+
+        answer = self.sql_executor.format_results(
+            exec_result, query, slots=sql_result.get("slots")
+        )
 
         return {
             "answer": answer,
             "route": "SQL",
             "sql": sql_result["sql"],
+            "sql_executed": exec_result.get("sql_executed"),
             "sql_explanation": sql_result.get("explanation"),
+            "sql_pattern": sql_result.get("pattern"),
             "tables_used": sql_result.get("tables_used", []),
             "row_count": exec_result["row_count"],
-            "query": query
+            "artifacts": arts,
+            "query": query,
         }
 
     def _execute_rag(
@@ -359,36 +435,55 @@ class QueryOrchestrator:
         """Execute RAG-only query."""
         logger.info("Executing RAG route")
 
-        # Search for relevant chunks
-        results = self.retriever.search(query, limit=5, score_threshold=0.5)
+        # document_ids is now honoured. It used to be accepted and ignored, so
+        # "ask this document" silently searched the whole corpus.
+        results = self.retriever.search(
+            query, limit=5, score_threshold=0.5, document_ids=document_ids
+        )
+
+        # Retry once without the threshold before giving up. A 0.49 match used
+        # to produce a flat "I couldn't find any relevant information", which
+        # is a worse answer than a hedged one.
+        if not results:
+            results = self.retriever.search(
+                query, limit=3, score_threshold=None, document_ids=document_ids
+            )
+            if results:
+                logger.info("No result cleared the threshold; answering from weaker matches")
 
         if not results:
             return {
                 "answer": "I couldn't find any relevant information to answer your question.",
                 "route": "RAG",
                 "sources": [],
-                "query": query
+                "artifacts": [],
+                "query": query,
             }
 
-        # Build context
         context = self.retriever.build_context(results)
-
-        # Generate answer
         answer = self.llm.generate_answer(query, context)
 
         return {
             "answer": answer,
             "route": "RAG",
+            # chunk_id, offsets and page are kept now: the retriever already
+            # returned them and dropping them left citations unlocatable.
             "sources": [
                 {
                     "score": r["score"],
                     "content": r["content"][:200] + "..." if len(r["content"]) > 200 else r["content"],
                     "heading_context": r.get("heading_context", ""),
-                    "source_file": r.get("source_file", "")
+                    "source_file": r.get("source_file", ""),
+                    "chunk_id": r.get("chunk_id"),
+                    "section": r.get("section"),
+                    "start_offset": r.get("start_offset"),
+                    "end_offset": r.get("end_offset"),
+                    "page_number": r.get("page_number"),
                 }
                 for r in results
             ],
-            "query": query
+            "artifacts": [],
+            "query": query,
         }
 
     def _execute_hybrid(
@@ -431,13 +526,36 @@ Be concise but thorough."""
             logger.error(f"Failed to merge results: {e}")
             merged_answer = f"**Data Analysis:**\n{sql_result.get('answer')}\n\n**Context:**\n{rag_result.get('answer')}"
 
+        # Carry the SQL leg's artifact across, marked as merged prose.
+        #
+        # On this route the answer text is a model merge of two other model
+        # outputs, three generative hops from the rows, while the artifact is
+        # zero. The flag lets the UI say which surface is verified - the whole
+        # point of building the classifier deterministically.
+        arts = [dict(a) for a in sql_result.get("artifacts", [])]
+        for art in arts:
+            art["provenance"] = {
+                **art["provenance"],
+                "answer_is_llm_merged": True,
+                "source_documents": [
+                    {"source_file": s.get("source_file", ""), "score": s.get("score")}
+                    for s in rag_result.get("sources", [])
+                ],
+            }
+
         return {
             "answer": merged_answer,
             "route": "HYBRID",
             "sql": sql_result.get("sql"),
+            "sql_explanation": sql_result.get("sql_explanation"),
+            # Both legs' failures used to be dropped entirely, so a hybrid
+            # answer whose SQL leg failed reported nothing at all.
+            "sql_error": sql_result.get("error"),
             "tables_used": sql_result.get("tables_used", []),
+            "row_count": sql_result.get("row_count"),
             "sources": rag_result.get("sources", []),
-            "query": query
+            "artifacts": arts,
+            "query": query,
         }
 
 
