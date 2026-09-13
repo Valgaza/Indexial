@@ -5,27 +5,24 @@ Flask REST API for the Indexial RAG + SQL system.
 Provides endpoints for document upload, querying, and session management.
 """
 
-import os
 import shutil
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Optional
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
-
-from pipeline import IngestionPipeline
-from router import QueryOrchestrator
-from memory import MemoryManager
-from db import get_connection
 from psycopg2 import sql as psql
-from sql_engine import TableRegistryReader
 
-load_dotenv()
+from indexial.core import config
+from indexial.core.db import get_connection
+from indexial.core.schema import TRUNCATE_TABLES
+from indexial.ingest.pipeline import IngestionPipeline
+from indexial.memory import MemoryManager
+from indexial.query.router import QueryOrchestrator
+from indexial.query.sql_engine import TableRegistryReader
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,13 +32,16 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# Configuration
-UPLOAD_FOLDER = Path(os.getenv("UPLOAD_FOLDER", "uploads"))
-UPLOAD_FOLDER.mkdir(exist_ok=True)
+# Configuration. Every path is absolute and derived from the repository root,
+# so the server behaves identically started from backend/ or from the root.
+config.require()
+config.ensure_dirs()
+
+UPLOAD_FOLDER = config.UPLOAD_DIR
 ALLOWED_EXTENSIONS = {"pdf"}
 
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB max file size
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_UPLOAD_BYTES
 
 # Initialize global components
 memory_manager = MemoryManager()
@@ -53,7 +53,7 @@ table_registry = TableRegistryReader()
 _reset_lock = threading.Lock()
 _resetting = False
 _last_activity_time = time.time()
-INACTIVITY_TIMEOUT_SECONDS = int(os.getenv("INACTIVITY_TIMEOUT_SECONDS", 2 * 60 * 60))
+INACTIVITY_TIMEOUT_SECONDS = config.INACTIVITY_TIMEOUT_SECONDS
 
 
 # =================== Helper Functions =================== #
@@ -140,60 +140,49 @@ def perform_reset():
             "errors": [],
         }
 
-        # Step 1: Discover dynamic tables from registry
-        dynamic_tables = []
-        try:
-            with get_connection(readonly=True) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT physical_table_name FROM table_registry")
-                dynamic_tables = [row[0] for row in cur.fetchall()]
-                cur.close()
-        except Exception as e:
-            logger.warning(f"Could not read table_registry: {e}")
-
-        # Step 2: DROP each dynamic table
-        for table_name in dynamic_tables:
-            try:
-                with get_connection() as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        psql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
-                            psql.Identifier(table_name)
-                        )
-                    )
-                    conn.commit()
-                    cur.close()
-                    summary["tables_dropped"].append(table_name)
-                    logger.info(f"Dropped table: {table_name}")
-            except Exception as e:
-                logger.error(f"Failed to drop table {table_name}: {e}")
-                summary["errors"].append(f"DROP {table_name}: {str(e)}")
-
-        # Step 3: TRUNCATE fixed tables
-        fixed_tables = ["document_chunks", "table_registry", "documents"]
+        # One TRUNCATE across a fixed set of tables.
+        #
+        # This used to read physical_table_name out of the registry and DROP
+        # each dynamic table in its own connection. That had two failure modes
+        # the fixed schema removes: a table whose registry row was lost could
+        # never be dropped, and a mid-loop error left the database half reset.
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                for table_name in fixed_tables:
-                    try:
-                        cur.execute(f"TRUNCATE TABLE {table_name} CASCADE")
-                        summary["tables_truncated"].append(table_name)
-                        logger.info(f"Truncated table: {table_name}")
-                    except Exception as e:
-                        logger.warning(f"Could not truncate {table_name}: {e}")
-                        conn.rollback()
-                        summary["errors"].append(f"TRUNCATE {table_name}: {str(e)}")
+                cur.execute(
+                    f"TRUNCATE TABLE {', '.join(TRUNCATE_TABLES)} RESTART IDENTITY CASCADE"
+                )
+                conn.commit()
+                cur.close()
+            summary["tables_truncated"] = list(TRUNCATE_TABLES)
+            logger.info(f"Truncated: {', '.join(TRUNCATE_TABLES)}")
+        except Exception as e:
+            logger.error(f"Database truncation failed: {e}")
+            summary["errors"].append(f"TRUNCATE: {str(e)}")
+
+        # Sweep any relation left behind by the pre-fact-store design.
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    r"""SELECT tablename FROM pg_tables
+                        WHERE schemaname='public' AND tablename LIKE 'tbl\_%\_extracted'"""
+                )
+                for (name,) in cur.fetchall():
+                    cur.execute(
+                        psql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(psql.Identifier(name))
+                    )
+                    summary["tables_dropped"].append(name)
                 conn.commit()
                 cur.close()
         except Exception as e:
-            logger.error(f"Database truncation failed: {e}")
-            summary["errors"].append(f"TRUNCATE connection: {str(e)}")
+            logger.warning(f"Legacy table sweep failed: {e}")
 
         # Step 4: Clear filesystem artifacts
         dirs_to_clear = [
             UPLOAD_FOLDER,
-            Path("output/markdown"),
-            Path("output/chunks"),
+            config.MARKDOWN_DIR,
+            config.CHUNKS_DIR,
         ]
 
         files_removed = 0
@@ -281,12 +270,22 @@ def upload_document():
         force = request.form.get("force", "false").lower() == "true"
         result = ingestion_pipeline.process_pdf(str(filepath), force=force)
 
+        skipped = result.get("skipped", False)
         return jsonify({
-            "message": "Document uploaded and queued for processing",
-            "document_id": result["doc_id"],
+            "message": (
+                "Document already processed"
+                if skipped
+                else "Document uploaded and processed"
+            ),
+            # .get(), not ["doc_id"]. The skip path returns no document id, so
+            # re-uploading a duplicate PDF used to raise KeyError and 500.
+            "document_id": result.get("doc_id"),
             "filename": filename,
-            "status": result["status"],
-            "skipped": result.get("skipped", False)
+            "status": result.get("status"),
+            "skipped": skipped,
+            "table_count": len(result.get("tables_created", [])),
+            "fact_count": result.get("fact_count", 0),
+            "chunk_count": result.get("chunk_count", 0),
         }), 201
 
     except Exception as e:
@@ -488,50 +487,51 @@ def list_tables():
         document_ids_str = request.args.get("document_ids")
         document_ids = document_ids_str.split(",") if document_ids_str else None
 
+        # physical_table_name no longer names a relation - table rows live in
+        # document_facts. It is computed here rather than stored, so the column
+        # cannot drift into lying about reality, while the frontend keeps the
+        # same string shape and the same React key.
+        query = """
+            SELECT table_id,
+                   'tbl_' || left(document_id::text, 8) || '_t' || table_index
+                       AS physical_table_name,
+                   document_id, semantic_description, headers, column_keys,
+                   row_count, fact_count, original_filename,
+                   page_start, page_end, created_at
+            FROM table_registry
+            WHERE (%(doc_ids)s::text[] IS NULL
+                   OR document_id::text = ANY(%(doc_ids)s::text[]))
+            ORDER BY created_at DESC
+        """
+
         with get_connection(readonly=True) as conn:
             cur = conn.cursor()
-
-            if document_ids:
-                placeholders = ",".join(["%s"] * len(document_ids))
-                query = f"""
-                    SELECT id, physical_table_name, source_doc_uuid,
-                           semantic_description, headers, row_count,
-                           original_filename, created_at
-                    FROM table_registry
-                    WHERE source_doc_uuid::text IN ({placeholders})
-                    ORDER BY created_at DESC
-                """
-                cur.execute(query, document_ids)
-            else:
-                query = """
-                    SELECT id, physical_table_name, source_doc_uuid,
-                           semantic_description, headers, row_count,
-                           original_filename, created_at
-                    FROM table_registry
-                    ORDER BY created_at DESC
-                """
-                cur.execute(query)
-
+            cur.execute(query, {"doc_ids": document_ids})
             rows = cur.fetchall()
             cur.close()
 
-            tables = []
-            for row in rows:
-                tables.append({
-                    "id": row[0],
-                    "physical_table_name": row[1],
-                    "source_doc_uuid": str(row[2]),
-                    "semantic_description": row[3],
-                    "headers": row[4],  # Already parsed JSONB
-                    "row_count": row[5],
-                    "original_filename": row[6],
-                    "created_at": row[7].isoformat() if row[7] else None
-                })
+        tables = [
+            {
+                "id": str(row[0]),
+                "table_id": str(row[0]),
+                "physical_table_name": row[1],
+                "source_doc_uuid": str(row[2]),
+                "semantic_description": row[3],
+                # headers and row_count are hard invariants: tables-view calls
+                # .map() and .toLocaleString() on them unguarded.
+                "headers": row[4] or [],
+                "column_keys": row[5] or [],
+                "row_count": row[6] or 0,
+                "fact_count": row[7] or 0,
+                "original_filename": row[8],
+                "page_start": row[9],
+                "page_end": row[10],
+                "created_at": row[11].isoformat() if row[11] else None,
+            }
+            for row in rows
+        ]
 
-            return jsonify({
-                "tables": tables,
-                "total": len(tables)
-            }), 200
+        return jsonify({"tables": tables, "total": len(tables)}), 200
 
     except Exception as e:
         logger.error(f"List tables failed: {e}")
@@ -569,9 +569,13 @@ def _inactivity_checker():
 
 # =================== Main =================== #
 
-if __name__ == "__main__":
-    port = int(os.getenv("API_PORT", 8000))
-    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
+def main() -> None:
+    """Entry point: `python -m indexial.api.app`."""
+    import os
+
+    port = config.API_PORT
+    debug = config.FLASK_DEBUG
 
     # Start inactivity timer (avoid double-start with Flask reloader)
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
@@ -581,3 +585,7 @@ if __name__ == "__main__":
 
     logger.info(f"Starting Indexial API on port {port}")
     app.run(host="0.0.0.0", port=port, debug=debug)
+
+
+if __name__ == "__main__":
+    main()
